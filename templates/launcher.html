@@ -1,0 +1,43 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Opening incident...</title>
+  <script>
+    // popup_url will be injected by Flask
+    const popupUrl = "{{ popup_url }}";
+
+    function openAndClose() {
+      // feature string: size and some chrome
+      const features = 'toolbar=no,location=no,status=no,menubar=no,scrollbars=yes,resizable=yes,width=900,height=700';
+      // Try to open a new window. Some browsers may open a new tab despite this.
+      const win = window.open(popupUrl, '_blank', features);
+      if (win) {
+        // Try to focus the new window
+        try { win.focus(); } catch (e) {}
+        // Close the launcher page after a short delay so popup has time to open
+        setTimeout(() => { window.close(); }, 300);
+      } else {
+        // If popup blocked, show a link the user can click
+        const el = document.getElementById('blocked');
+        if (el) el.style.display = 'block';
+      }
+    }
+
+    // Run on load
+    window.addEventListener('load', openAndClose);
+  </script>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial; padding: 24px; }
+    .link { margin-top: 16px; }
+  </style>
+</head>
+<body>
+  <h3>Opening incident in a new window...</h3>
+  <div id="blocked" style="display:none">
+    <p>Popup was blocked by your browser. Click the link below to open the incident:</p>
+    <p class="link"><a href="{{ popup_url }}" target="_blank">Open incident</a></p>
+  </div>
+  <p>If nothing happens, please allow popups for this site or click the link above.</p>
+</body>
+</html>

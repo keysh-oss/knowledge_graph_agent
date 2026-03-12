@@ -1,0 +1,9 @@
+Flask>=2.0
+slack-sdk>=3.19.0
+neo4j>=5.0
+APScheduler>=3.9
+python-dotenv>=1.0
+requests>=2.0
+openai>=1.0.0
+fastapi>=0.95.0
+uvicorn>=0.22.0

@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Incident Popup</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    .card { border: 1px solid #ddd; padding: 16px; border-radius: 8px; max-width: 900px; }
+    h1 { margin-top: 0; }
+    .section { margin-top: 12px; }
+    pre { background:#f6f6f6; padding:8px; border-radius:4px; overflow:auto }
+    .small { color: #666; font-size: 0.9em }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>{{ incident.title }}</h1>
+    <p class="small">Message: {{ incident.message }}</p>
+
+    {% if incident.found %}
+    <div class="section">
+      <h3>Issue / Node</h3>
+      <pre>{{ incident.data.issue | tojson(indent=2) }}</pre>
+    </div>
+
+    <div class="section">
+      <h3>Messages</h3>
+      {% if incident.data.messages|length == 0 %}
+        <p class="small">No related messages found.</p>
+      {% else %}
+        {% for m in incident.data.messages %}
+          <pre>{{ m | tojson(indent=2) }}</pre>
+        {% endfor %}
+      {% endif %}
+    </div>
+
+    <div class="section">
+      <h3>Comments</h3>
+      {% if incident.data.comments|length == 0 %}
+        <p class="small">No comments found.</p>
+      {% else %}
+        {% for c in incident.data.comments %}
+          <pre>{{ c | tojson(indent=2) }}</pre>
+        {% endfor %}
+      {% endif %}
+    </div>
+
+    <div class="section">
+      <h3>Pages</h3>
+      {% if incident.data.pages|length == 0 %}
+        <p class="small">No linked pages found.</p>
+      {% else %}
+        {% for p in incident.data.pages %}
+          <pre>{{ p | tojson(indent=2) }}</pre>
+        {% endfor %}
+      {% endif %}
+    </div>
+
+    <div class="section">
+      <h3>Projects</h3>
+      {% if incident.data.projects|length == 0 %}
+        <p class="small">No linked projects found.</p>
+      {% else %}
+        {% for pr in incident.data.projects %}
+          <pre>{{ pr | tojson(indent=2) }}</pre>
+        {% endfor %}
+      {% endif %}
+    </div>
+    {% if incident.mcp or (incident.data and incident.data.graph) %}
+    <div class="section">
+      <h3>Related knowledge graph</h3>
+      <div style="display:flex;gap:16px;">
+        <div>
+          <div id="network" style="width:700px;height:500px;border:1px solid #ddd;"></div>
+          <div style="margin-top:8px;">
+            <button id="open-graph-window">Open graph in new window</button>
+          </div>
+        </div>
+        <div style="width:180px;">
+          <h4>Node details</h4>
+          <pre id="node-details-json" style="background:#f6f6f6;padding:8px;max-height:360px;overflow:auto">Select a node to see details</pre>
+          <div id="node-links" style="margin-top:8px"></div>
+        </div>
+      </div>
+      <script src="https://unpkg.com/vis-network@9.1.2/dist/vis-network.min.js"></script>
+      {% set kg = incident.mcp.graph if incident.mcp else (incident.data.graph if incident.data else {'nodes': [], 'edges': []}) %}
+      <script>
+        // prefer MCP graph if present (kg computed by Jinja above)
+        var kg = JSON.parse('{{ kg | tojson | escapejs }}');
+        var nodes = new vis.DataSet((kg.nodes || []).map(function(n){return {id:n.id, label:n.label, title: JSON.stringify(n.props, null, 2), _props: n.props};}));
+        var edges = new vis.DataSet((kg.edges || []).map(function(e){return {from:e.from, to:e.to, label:e.label};}));
+        var container = document.getElementById('network');
+        var data = { nodes: nodes, edges: edges };
+        var options = { layout:{ improvedLayout:true }, edges:{ smooth:false }, physics:{ stabilization:true } };
+        var network = new vis.Network(container, data, options);
+
+        // Node click handler: show properties and links if present
+        network.on('click', function(params) {
+          var detailsEl = document.getElementById('node-details-json');
+          var linksEl = document.getElementById('node-links');
+          linksEl.innerHTML = '';
+          if (!params.nodes || params.nodes.length === 0) {
+            detailsEl.textContent = 'Select a node to see details';
+            return;
+          }
+          var nid = params.nodes[0];
+          var node = nodes.get(nid);
+          var props = node && node._props ? node._props : {};
+          detailsEl.textContent = JSON.stringify(props, null, 2);
+
+          // Add helpful links: url, jira key
+          if (props.url) {
+            var a = document.createElement('a');
+            a.href = props.url;
+            a.target = '_blank';
+            a.textContent = 'Open linked URL';
+            linksEl.appendChild(a);
+          }
+          if (props.key) {
+            var btn = document.createElement('button');
+            btn.textContent = 'Search Jira (web)';
+            btn.onclick = function(){ window.open("https://www.google.com/search?q=" + encodeURIComponent(props.key), '_blank'); };
+            linksEl.appendChild(btn);
+          }
+          // generic copy button for key or url
+          if (props.key || props.url) {
+            var copyBtn = document.createElement('button');
+            copyBtn.textContent = 'Copy key/URL';
+            copyBtn.onclick = function(){
+              var toCopy = props.key || props.url;
+              navigator.clipboard.writeText(toCopy);
+            };
+            linksEl.appendChild(copyBtn);
+          }
+        });
+
+        // Open graph in a new window (clone the graph data and open a minimal viewer)
+        document.getElementById('open-graph-window').addEventListener('click', function(){
+          var win = window.open('', '_blank', 'toolbar=no,location=no,status=no,menubar=no,scrollbars=yes,resizable=yes,width=1000,height=800');
+          if (!win) return alert('Popup blocked; allow popups for this site');
+          var html = [
+            '<!doctype html><html><head><meta charset="utf-8"><title>Graph</title>',
+            '<script src="https://unpkg.com/vis-network@9.1.2/dist/vis-network.min.js"></scr' + 'ipt>',
+            '<style>body{font-family:Arial;padding:12px}</style></head><body>',
+            '<div id="net" style="width:960px;height:720px;border:1px solid #ddd"></div>',
+            '<script>',
+            'var kg=' + JSON.stringify(kg) + ';',
+            'var nodes=new vis.DataSet((kg.nodes||[]).map(function(n){return {id:n.id,label:n.label,title:JSON.stringify(n.props,null,2)};}));',
+            'var edges=new vis.DataSet((kg.edges||[]).map(function(e){return {from:e.from,to:e.to,label:e.label};}));',
+            'new vis.Network(document.getElementById("net"),{nodes:nodes,edges:edges},{layout:{improvedLayout:true},edges:{smooth:false}});',
+            '</scr' + 'ipt></body></html>'
+          ].join('');
+          win.document.write(html);
+          win.document.close();
+        });
+      </script>
+    </div>
+    {% endif %}
+
+    {% else %}
+    <div class="section">
+      <h3>Message (no matching incident in Neo4j)</h3>
+      <pre>{{ incident.message }}</pre>
+    </div>
+    {% endif %}
+
+  </div>
+</body>
+</html>
