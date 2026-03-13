@@ -118,10 +118,6 @@ echo "Starting IncidentAgent (agent)"
 nohup .venv/bin/python -u -c "from src.agent import IncidentAgent; agent=IncidentAgent('config.json'); agent.start()" > agent.log 2>&1 & echo $! > agent.pid
 sleep 0.5
 
-
-
-
-
   # Start MCP server (uvicorn)
 echo "Starting MCP server on 127.0.0.1:9000"
 nohup .venv/bin/uvicorn src.mcp_server:app --host 127.0.0.1 --port 9000 > mcp.log 2>&1 & echo $! > mcp.pid || (echo "Failed to start mcp with .venv/bin/uvicorn, trying python -m uvicorn" && nohup .venv/bin/python -m uvicorn src.mcp_server:app --host 127.0.0.1 --port 9000 > mcp.log 2>&1 & echo $! > mcp.pid)
