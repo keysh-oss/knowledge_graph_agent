@@ -17,6 +17,7 @@
   <div class="card">
     <h1>{{ incident.title }}</h1>
     <p class="small">Message: {{ incident.message }}</p>
+    <p class="small">Last update: <span id="last-updated">now</span></p>
 
     {% if incident.found %}
     <div class="section">
@@ -67,7 +68,7 @@
         {% endfor %}
       {% endif %}
     </div>
-    {% if incident.mcp or (incident.data and incident.data.graph) %}
+  {% if incident.mcp or (incident.data and incident.data.graph) %}
     <div class="section">
       <h3>Related knowledge graph</h3>
       <div style="display:flex;gap:16px;">
@@ -157,6 +158,118 @@
       </script>
     </div>
     {% endif %}
+
+    <!-- Enrichment sections (Jira / Confluence / Suggested resolution) -->
+    <div class="section">
+      <h3>Jira — Tasks executed on previous day</h3>
+      <div id="jira-prev">
+        {% if incident.jira_prev_day and incident.jira_prev_day|length > 0 %}
+          <ul>
+            {% for it in incident.jira_prev_day %}
+              <li><a href="{{ it.url }}" target="_blank">{{ it.key }}</a> — {{ it.summary }} <span class="small">({{ it.status }})</span></li>
+            {% endfor %}
+          </ul>
+        {% else %}
+          <p class="small">No tasks found for the previous day.</p>
+        {% endif %}
+      </div>
+    </div>
+
+    <div class="section">
+      <h3>Jira — Related Issues</h3>
+      <div id="jira-related">
+        {% if incident.jira and incident.jira|length > 0 %}
+          <ul>
+            {% for it in incident.jira %}
+              <li><a href="{{ it.url }}" target="_blank">{{ it.key }}</a> — {{ it.summary }} <span class="small">({{ it.status }})</span></li>
+            {% endfor %}
+          </ul>
+        {% else %}
+          <p class="small">No related issues found.</p>
+        {% endif %}
+      </div>
+    </div>
+
+    <div class="section">
+      <h3>Confluence pages</h3>
+      <div id="confluence-list">
+        {% if incident.confluence and incident.confluence|length > 0 %}
+          <ul>
+            {% for p in incident.confluence %}
+              <li><a href="{{ p.url }}" target="_blank">{{ p.title }}</a>
+                <div class="small">{{ p.excerpt }}</div>
+              </li>
+            {% endfor %}
+          </ul>
+        {% else %}
+          <p class="small">No Confluence pages found.</p>
+        {% endif %}
+      </div>
+    </div>
+
+    <div class="section">
+      <h3>Suggested resolution</h3>
+      <div id="suggested-resolution">
+        {% if incident.suggested_resolution %}
+          <pre>{{ incident.suggested_resolution | tojson(indent=2) }}</pre>
+        {% else %}
+          <p class="small">No suggested resolution yet.</p>
+        {% endif %}
+      </div>
+    </div>
+
+    <script>
+      // Simple polling to refresh incident enrichment data
+      (function(){
+  var iid = '{{ iid }}';
+  var token = '{{ token or "" }}';
+        function humanNow(){ return new Date().toLocaleString(); }
+        function renderList(el, items){
+          if(!items || items.length === 0){ el.innerHTML = '<p class="small">No items found.</p>'; return; }
+          var html = ['<ul>'];
+          items.forEach(function(it){
+            var url = it.url || '#';
+            var key = it.key || it.id || it.title || '';
+            var summary = it.summary || it.excerpt || '';
+            var status = it.status ? (' <span class="small">(' + it.status + ')</span>') : '';
+            html.push('<li><a href="'+url+'" target="_blank">'+key+'</a> — '+escapeHtml(summary)+status+'</li>');
+          });
+          html.push('</ul>');
+          el.innerHTML = html.join('');
+        }
+        function escapeHtml(s){ return (s||'').replace(/[&<>\"']/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":"&#39;"}[c]; }); }
+
+        async function fetchIncident(){
+          try{
+            var url = '/incident/' + iid + (token ? ('?t=' + token) : '');
+            var resp = await fetch(url, {credentials: 'same-origin'});
+            if(!resp.ok) return;
+            var data = await resp.json();
+            document.getElementById('last-updated').textContent = humanNow();
+
+            // Update prev-day jira
+            var jp = document.getElementById('jira-prev');
+            if(jp) renderList(jp, data.jira_prev_day);
+            var jr = document.getElementById('jira-related');
+            if(jr) renderList(jr, data.jira);
+            var cl = document.getElementById('confluence-list');
+            if(cl) renderList(cl, data.confluence);
+            var sr = document.getElementById('suggested-resolution');
+            if(sr){
+              if(data.suggested_resolution){
+                sr.innerHTML = '<pre>'+escapeHtml(JSON.stringify(data.suggested_resolution, null, 2))+'</pre>';
+              } else {
+                sr.innerHTML = '<p class="small">No suggested resolution yet.</p>';
+              }
+            }
+          }catch(e){ /* ignore transient errors */ }
+        }
+
+        // initial fetch + polling
+        fetchIncident();
+        setInterval(fetchIncident, 5000);
+      })();
+    </script>
 
     {% else %}
     <div class="section">
