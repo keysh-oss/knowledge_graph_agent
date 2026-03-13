@@ -7,6 +7,7 @@ import uuid
 import json
 import logging
 import os
+import time
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify, render_template, session, redirect, url_for
 
@@ -21,6 +22,10 @@ app = Flask(__name__, template_folder=templates_path)
 UI_API_KEY = os.getenv("UI_API_KEY")
 app.secret_key = os.getenv("FLASK_SECRET") or os.urandom(24)
 
+# simple one-time tokens to allow the agent to open a popup in the browser
+# without requiring the user to log in interactively. Tokens are short-lived.
+ONE_TIME_TOKENS = {}
+
 def require_auth(f):
     def wrapper(*args, **kwargs):
         # if no UI_API_KEY configured, allow access
@@ -30,6 +35,19 @@ def require_auth(f):
         header = request.headers.get("X-API-KEY")
         if header and header == UI_API_KEY:
             return f(*args, **kwargs)
+        # allow one-time token passed as query param (used when the agent
+        # opens the popup in the browser). Tokens are validated against
+        # ONE_TIME_TOKENS and are short-lived.
+        token = request.args.get('t')
+        if token:
+            exp = ONE_TIME_TOKENS.get(token)
+            if exp and exp > time.time():
+                # consume the token (one-time)
+                try:
+                    del ONE_TIME_TOKENS[token]
+                except Exception:
+                    pass
+                return f(*args, **kwargs)
         # allow session-based login
         if session.get("authenticated"):
             return f(*args, **kwargs)
@@ -48,8 +66,45 @@ def receive_incident():
     iid = str(uuid.uuid4())
     INCIDENTS[iid] = payload
     popup_url = f"/popup/{iid}"
+    # if the request used a valid API key header (agent posted with X-API-KEY),
+    # create a short-lived one-time token so the agent can open the popup in
+    # the user's browser without requiring interactive login.
+    header = request.headers.get("X-API-KEY")
+    if UI_API_KEY and header and header == UI_API_KEY:
+        try:
+            token = uuid.uuid4().hex
+            # token valid for 30 seconds
+            ONE_TIME_TOKENS[token] = time.time() + 30
+            popup_url = f"/popup/{iid}?t={token}"
+        except Exception:
+            pass
     logging.info("Received incident %s", iid)
     return jsonify({"popup_url": popup_url})
+
+
+@app.route('/incident_update', methods=['POST'])
+@require_auth
+def incident_update():
+    """Accept partial enrichment updates for an existing incident.
+
+    Expected JSON: { iid: <id>, jira: [...], confluence: [...], suggested_resolution: {...} }
+    """
+    payload = request.get_json() or {}
+    iid = payload.get('iid')
+    if not iid:
+        return jsonify({'error': 'missing iid'}), 400
+    if iid not in INCIDENTS:
+        return jsonify({'error': 'unknown iid'}), 404
+
+    # merge fields into stored incident
+    # avoid overwriting the original slack/message by merging only provided keys
+    for k, v in payload.items():
+        if k == 'iid':
+            continue
+        INCIDENTS[iid][k] = v
+
+    logging.info('Updated incident %s', iid)
+    return jsonify({'ok': True})
 
 @app.route("/popup/<iid>")
 @require_auth
@@ -58,7 +113,18 @@ def popup(iid):
     if not data:
         return "Incident not found", 404
     # render a simple popup page
-    return render_template("popup.html", incident=data)
+    token = request.args.get('t')
+    return render_template("popup.html", incident=data, iid=iid, token=token)
+
+
+@app.route('/incident/<iid>', methods=['GET'])
+@require_auth
+def get_incident(iid):
+    """Return the stored incident JSON for client-side polling/refresh."""
+    data = INCIDENTS.get(iid)
+    if not data:
+        return jsonify({'error': 'not found'}), 404
+    return jsonify(data)
 
 
 @app.route('/popup_launcher/<iid>')
@@ -73,6 +139,11 @@ def popup_launcher(iid):
     if not data:
         return "Incident not found", 404
     popup_url = url_for('popup', iid=iid, _external=True)
+    # preserve one-time token query param if present so the popup can be
+    # opened without requiring interactive login
+    token = request.args.get('t')
+    if token:
+        popup_url = popup_url + ("&" if "?" in popup_url else "?") + f"t={token}"
     return render_template('launcher.html', popup_url=popup_url)
 
 @app.route("/")
@@ -98,4 +169,4 @@ def login():
 
 if __name__ == "__main__":
     # Note: for production use a proper WSGI server
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    app.run(host="127.0.0.1", port=5999, debug=False)

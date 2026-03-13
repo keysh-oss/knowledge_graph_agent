@@ -15,14 +15,17 @@ import threading
 import webbrowser
 from datetime import datetime
 import importlib
+# load env early
 from dotenv import load_dotenv
 load_dotenv()
-import src.llm as llm
-
-MCP_URL = os.getenv('MCP_URL')
-MCP_API_KEY = os.getenv('MCP_API_KEY')
-
 import os
+import src.llm as llm
+# optional Jira/Confluence integration
+try:
+    from src.integrations import jira_confluence as jc
+except Exception:
+    jc = None
+
 import requests
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
@@ -48,6 +51,37 @@ class IncidentAgent:
         with open(config_path, "r") as f:
             self.config = json.load(f)
 
+        # If jira/confluence not configured in config.json, try to read from env (.env)
+        updated = False
+        jira_cfg = self.config.get('jira') or {}
+        if not jira_cfg.get('base_url'):
+            jb = os.getenv('JIRA_BASE_URL')
+            je = os.getenv('JIRA_EMAIL')
+            jt = os.getenv('JIRA_API_TOKEN')
+            if jb and je and jt:
+                jira_cfg = {'base_url': jb, 'user': je, 'api_token': jt}
+                self.config['jira'] = jira_cfg
+                updated = True
+
+        conf_cfg = self.config.get('confluence') or {}
+        if not conf_cfg.get('base_url'):
+            cb = os.getenv('CONFLUENCE_BASE_URL')
+            ce = os.getenv('CONFLUENCE_EMAIL')
+            ct = os.getenv('CONFLUENCE_API_TOKEN')
+            if cb and ce and ct:
+                conf_cfg = {'base_url': cb, 'user': ce, 'api_token': ct}
+                self.config['confluence'] = conf_cfg
+                updated = True
+
+        # persist back to config.json so future runs pick it up (only if we read from env)
+        if updated:
+            try:
+                with open(config_path, 'w') as f:
+                    json.dump(self.config, f, indent=2)
+                logging.info('Wrote jira/confluence config to %s from environment', config_path)
+            except Exception:
+                logging.exception('Failed to persist updated config.json')
+
         self.slack_conf = self.config.get("slack", {})
         self.neo4j_conf = self.config.get("neo4j", {})
         self.web_conf = self.config.get("web_ui", {})
@@ -66,6 +100,8 @@ class IncidentAgent:
         # optional Socket Mode app token (xapp-...) for real-time events
         self.app_token = self.slack_conf.get("app_token")
         self.socket_client = None
+        # track which popup iids we've opened to avoid duplicate windows
+        self._opened_iids = set()
 
     def start(self):
         logging.info("Starting IncidentAgent")
@@ -192,28 +228,9 @@ class IncidentAgent:
         # fetch data from Neo4j
         # First try MCP (NL -> Cypher -> Neo4j) if configured. MCP will return a graph
         # (nodes/edges) and the cypher used. Fall back to local fetch if MCP not available
-        mcp_result = None
-        try:
-            mcp_url = MCP_URL or self.config.get('mcp', {}).get('url')
-            mcp_key = MCP_API_KEY or self.config.get('mcp', {}).get('api_key')
-            if mcp_url:
-                headers = {}
-                if mcp_key:
-                    headers['X-MCP-API-KEY'] = mcp_key
-                r = requests.post(mcp_url, json={'q': search_text}, headers=headers, timeout=8)
-                if r.status_code == 200:
-                    mcp_result = r.json()
-                else:
-                    logging.warning("MCP returned %s: %s", r.status_code, r.text[:200])
-        except Exception:
-            logging.exception("Error calling MCP for query")
-
-        incident_data = None
-        if mcp_result and mcp_result.get('graph'):
-            # convert MCP graph into incident_data shape for the UI
-            incident_data = {'graph': mcp_result.get('graph'), 'cypher': mcp_result.get('cypher')}
-        else:
-            incident_data = self.fetch_incident_data(jira_key=jira_key, text=search_text)
+        # We no longer call an external MCP server from this agent; directly
+        # query Neo4j for incident data using the local fetch helper.
+        incident_data = self.fetch_incident_data(jira_key=jira_key, text=search_text)
         if not incident_data:
             logging.info("No incident data found in Neo4j for message: %s", text[:120])
             # still show a minimal popup with message
@@ -223,9 +240,7 @@ class IncidentAgent:
                 "slack": {"channel": channel_id, "ts": ts, "user": user},
                 "found": False,
             }
-            # attach MCP result if available
-            if mcp_result:
-                incident_payload['mcp'] = mcp_result
+            # no MCP integration in this workspace; we show a minimal popup
         else:
             # adapt to discovered schema: primary object may be an Issue or a generic node
             issue = incident_data.get("issue") or incident_data.get("node")
@@ -236,12 +251,59 @@ class IncidentAgent:
                 "data": incident_data,
                 "found": True,
             }
-            if mcp_result:
-                incident_payload['mcp'] = mcp_result
+            # no MCP integration in this workspace
+
+        # --- Jira / Confluence enrichments ---
+        try:
+            jira_cfg = self.config.get('jira') or {}
+            conf_cfg = self.config.get('confluence') or {}
+            jira_keys = []
+            if llm_data:
+                jira_keys = llm_data.get('jira_keys') or []
+            # also include detected top-level jira_key
+            if jira_key and jira_key not in jira_keys:
+                jira_keys = [jira_key] + jira_keys
+
+            jira_results = []
+            conf_results = []
+            suggested = None
+            if jc is not None:
+                try:
+                    # use the LLM-driven Jira query that returns prev_day and related issues
+                    jira_sets = jc.query_jira_with_llm(jira_cfg, incident_text=text, max_results=50)
+                    jira_results = jira_sets.get('related', [])
+                    jira_prev_day = jira_sets.get('prev_day', [])
+                except Exception:
+                    logging.exception("Error querying Jira via LLM integration")
+                try:
+                    # for Confluence, search using the LLM summary if available
+                    conf_query_text = (llm_data.get('summary') if llm_data and llm_data.get('summary') else search_text)
+                    conf_results = jc.query_confluence(conf_cfg, query=conf_query_text, jira_keys=jira_keys)
+                except Exception:
+                    logging.exception("Error querying Confluence via integration")
+                try:
+                    suggested = jc.summarize_with_llm((jira_results or []) + (jira_prev_day or []), conf_results, incident_text=text)
+                except Exception:
+                    logging.exception("Error summarizing Jira/Confluence results with LLM")
+            else:
+                logging.debug("Jira/Confluence integration module not available; skipping")
+
+            # attach results to payload (attach even when not found so UI can render a "no results" state)
+            incident_payload['jira'] = jira_results
+            incident_payload['confluence'] = conf_results
+            if suggested:
+                incident_payload['suggested_resolution'] = suggested
+        except Exception:
+            logging.exception("Unexpected error enriching incident with Jira/Confluence data")
 
         # post to web UI
         try:
-            r = requests.post(self.web_endpoint, json=incident_payload, timeout=5)
+            # include UI API key header if configured so the UI accepts the request
+            headers = {}
+            ui_key = self.web_conf.get('api_key') or os.getenv('UI_API_KEY')
+            if ui_key:
+                headers['X-API-KEY'] = ui_key
+            r = requests.post(self.web_endpoint, json=incident_payload, timeout=5, headers=headers)
             if r.status_code == 200:
                 # open popup in browser
                 pop_url = r.json().get("popup_url")
@@ -260,8 +322,30 @@ class IncidentAgent:
                         # fallback: just use the returned url
                         launcher = pop_url
                     full = base + launcher
-                    # open in background thread to avoid blocking
-                    threading.Thread(target=webbrowser.open, args=(full, 1)).start()
+                    # extract iid so we can enrich it asynchronously
+                    try:
+                        if pop_url.startswith("/popup/"):
+                            iid = pop_url.split("/popup/", 1)[1]
+                        else:
+                            # try to parse from the returned URL
+                            iid = pop_url.rstrip("/").split("/")[-1]
+                    except Exception:
+                        iid = None
+
+                    # open in background thread to avoid blocking, but avoid opening the
+                    # same iid multiple times (dedupe). We still run enrichment even if
+                    # the popup was already opened earlier.
+                    if iid and iid not in self._opened_iids:
+                        threading.Thread(target=webbrowser.open, args=(full, 1)).start()
+                        # remember we've opened it
+                        try:
+                            self._opened_iids.add(iid)
+                        except Exception:
+                            pass
+
+                    # spawn background enrichment (non-blocking)
+                    if iid:
+                        threading.Thread(target=self._async_enrich_and_update, args=(iid, search_text, jira_key, llm_data, text), daemon=True).start()
             else:
                 logging.error("Failed to post incident to web UI: %s %s", r.status_code, r.text)
         except Exception:
@@ -308,6 +392,62 @@ RETURN n AS node, collect(DISTINCT m) AS messages, collect(DISTINCT c) AS commen
                     return self._record_to_dict(record)
 
         return None
+
+    def _post_update_to_ui(self, iid: str, update: dict):
+        """Post partial enrichment updates to the web UI (/incident_update).
+
+        Sends X-API-KEY header if UI API key is configured via env or config.
+        """
+        try:
+            host = self.web_conf.get("host", "127.0.0.1")
+            port = self.web_conf.get("port", 5000)
+            url = f"http://{host}:{port}/incident_update"
+            headers = {}
+            # prefer configured web UI API key, fall back to env
+            ui_key = self.web_conf.get('api_key') or os.getenv('UI_API_KEY')
+            if ui_key:
+                headers['X-API-KEY'] = ui_key
+            payload = {'iid': iid}
+            payload.update(update)
+            requests.post(url, json=payload, headers=headers, timeout=8)
+        except Exception:
+            logging.exception("Failed to post enrichment update to web UI")
+
+    def _async_enrich_and_update(self, iid: str, search_text: str, jira_key: str, llm_data: dict, original_text: str):
+        """Run Jira/Confluence queries and LLM summarization in background and push results to the web UI."""
+        if jc is None:
+            logging.debug("Jira/Confluence integration not available; skipping async enrichment")
+            return
+
+        try:
+            jira_cfg = self.config.get('jira') or {}
+            conf_cfg = self.config.get('confluence') or {}
+            jira_keys = []
+            if llm_data:
+                jira_keys = llm_data.get('jira_keys') or []
+            if jira_key and jira_key not in jira_keys:
+                jira_keys = [jira_key] + jira_keys
+
+            # use LLM-driven jira queries (prev_day + related)
+            jira_sets = jc.query_jira_with_llm(jira_cfg, incident_text=original_text, max_results=50)
+            jira_results = jira_sets.get('related', [])
+            jira_prev_day = jira_sets.get('prev_day', [])
+            conf_query_text = (llm_data.get('summary') if llm_data and llm_data.get('summary') else search_text)
+            conf_results = jc.query_confluence(conf_cfg, query=conf_query_text, jira_keys=jira_keys)
+            suggested = jc.summarize_with_llm((jira_results or []) + (jira_prev_day or []), conf_results, incident_text=original_text)
+
+            update = {
+                'jira': jira_results,
+                'jira_prev_day': jira_prev_day,
+                'confluence': conf_results,
+            }
+            if suggested:
+                update['suggested_resolution'] = suggested
+
+            # post update to web UI
+            self._post_update_to_ui(iid, update)
+        except Exception:
+            logging.exception("Error during async enrichment")
 
     # --- persistence for last_ts ---
     def _load_last_ts(self):

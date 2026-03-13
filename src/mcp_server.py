@@ -13,6 +13,7 @@ import re
 import json
 import logging
 from neo4j import GraphDatabase
+from neo4j.exceptions import AuthError as Neo4jAuthError
 from openai import OpenAI
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -41,11 +42,19 @@ READONLY_BLACKLIST = re.compile(r"\b(create|merge|delete|set|remove|drop|call\s+
 
 
 def fetch_schema_snapshot(limit_samples: int = 5) -> Dict[str, Any]:
-    with driver.session() as s:
-        labels = [r["label"] for r in s.run("CALL db.labels() YIELD label RETURN label")]
-        props = [r["propertyKey"] for r in s.run("CALL db.propertyKeys() YIELD propertyKey RETURN propertyKey")]
-        samples = s.run("MATCH (n) RETURN labels(n) AS labels, keys(n) AS keys, n LIMIT $l", l=limit_samples).data()
-    return {"labels": labels, "props": props, "samples": samples}
+    try:
+        with driver.session() as s:
+            labels = [r["label"] for r in s.run("CALL db.labels() YIELD label RETURN label")]
+            props = [r["propertyKey"] for r in s.run("CALL db.propertyKeys() YIELD propertyKey RETURN propertyKey")]
+            samples = s.run("MATCH (n) RETURN labels(n) AS labels, keys(n) AS keys, n LIMIT $l", l=limit_samples).data()
+        return {"labels": labels, "props": props, "samples": samples}
+    except Neo4jAuthError as e:
+        logging.exception("Neo4j authentication failed when fetching schema snapshot")
+        # Raise a FastAPI-friendly HTTPException so the endpoint returns a clear error
+        raise HTTPException(status_code=503, detail="Neo4j authentication failed: check NEO4J_USER/NEO4J_PASSWORD")
+    except Exception:
+        logging.exception("Failed to fetch schema snapshot from Neo4j")
+        raise HTTPException(status_code=503, detail="Failed to fetch schema snapshot from Neo4j")
 
 
 def validate_cypher(q: str) -> Tuple[bool, str]:
