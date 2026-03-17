@@ -102,6 +102,8 @@ class IncidentAgent:
         self.socket_client = None
         # track which popup iids we've opened to avoid duplicate windows
         self._opened_iids = set()
+        # lock to make check-and-add atomic across threads in this process
+        self._opened_iids_lock = threading.Lock()
 
     def start(self):
         logging.info("Starting IncidentAgent")
@@ -239,6 +241,9 @@ class IncidentAgent:
                 "message": text,
                 "slack": {"channel": channel_id, "ts": ts, "user": user},
                 "found": False,
+                # mark Neo4j search completed (no results)
+                "neo4j_done": True,
+                "neo4j_result": None,
             }
             # no MCP integration in this workspace; we show a minimal popup
         else:
@@ -250,8 +255,16 @@ class IncidentAgent:
                 "message": text,
                 "data": incident_data,
                 "found": True,
+                # mark Neo4j search completed and attach raw result
+                "neo4j_done": True,
+                "neo4j_result": incident_data,
             }
             # no MCP integration in this workspace
+            # If the fetch returned multiple rows (mcp_rows), attach them as mcp_result
+            if isinstance(incident_data, dict) and incident_data.get('mcp_rows'):
+                incident_payload['mcp_result'] = incident_data.get('mcp_rows')
+                # also set a simplified neo4j_result to the rows
+                incident_payload['neo4j_result'] = incident_data.get('mcp_rows')
 
         # --- Jira / Confluence enrichments ---
         try:
@@ -293,6 +306,11 @@ class IncidentAgent:
             incident_payload['confluence'] = conf_results
             if suggested:
                 incident_payload['suggested_resolution'] = suggested
+            # mark enrichment as completed synchronously so the agent can open the
+            # popup with Jira/Confluence data already present
+            incident_payload['jira_done'] = True
+            incident_payload['confluence_done'] = True
+            incident_payload['enrichment_done'] = True
         except Exception:
             logging.exception("Unexpected error enriching incident with Jira/Confluence data")
 
@@ -332,16 +350,92 @@ class IncidentAgent:
                     except Exception:
                         iid = None
 
-                    # open in background thread to avoid blocking, but avoid opening the
-                    # same iid multiple times (dedupe). We still run enrichment even if
-                    # the popup was already opened earlier.
-                    if iid and iid not in self._opened_iids:
-                        threading.Thread(target=webbrowser.open, args=(full, 1)).start()
-                        # remember we've opened it
+                    # open in background thread to avoid blocking. Use a lock-protected
+                    # check-and-add so multiple threads in this process don't open the
+                    # same iid concurrently. (Note: this does not dedupe across
+                    # separate processes.) We still run enrichment even if the popup
+                    # was already opened earlier.
+                    if iid:
+                        already_opened = False
                         try:
-                            self._opened_iids.add(iid)
+                            with self._opened_iids_lock:
+                                if iid in self._opened_iids:
+                                    already_opened = True
+                                else:
+                                    # reserve this iid so other threads won't also open it
+                                    self._opened_iids.add(iid)
                         except Exception:
-                            pass
+                            # if locking fails, fall back to the old behavior
+                            already_opened = (iid in self._opened_iids)
+
+                        if already_opened:
+                            logging.info('Popup already opened for %s in this process; skipping open', iid)
+                        else:
+                            # Wait until the server indicates Neo4j search and enrichment are done
+                            try:
+                                host = self.web_conf.get("host", "127.0.0.1")
+                                port = self.web_conf.get("port", 5000)
+                                check_url = f"http://{host}:{port}/incident/{iid}"
+                                claim_url = f"http://{host}:{port}/claim_popup"
+                                headers_check = {}
+                                ui_key = self.web_conf.get('api_key') or os.getenv('UI_API_KEY')
+                                if ui_key:
+                                    headers_check['X-API-KEY'] = ui_key
+
+                                # poll for completion up to a timeout (in seconds)
+                                poll_interval = 1.0
+                                max_wait = int(os.getenv('POPUP_WAIT_TIMEOUT') or 30)
+                                waited = 0
+                                opened = False
+                                while waited <= max_wait:
+                                    try:
+                                        resp = requests.get(check_url, headers=headers_check, timeout=3)
+                                    except Exception:
+                                        resp = None
+                                    if resp and resp.ok:
+                                        stored = resp.json()
+                                        neo_done = bool(stored.get('neo4j_done'))
+                                        enrich_done = bool(stored.get('enrichment_done') or (stored.get('jira_done') and stored.get('confluence_done')))
+                                        if neo_done and enrich_done:
+                                            # attempt to claim the popup on the central UI
+                                            try:
+                                                rclaim = requests.post(claim_url, json={'iid': iid}, headers=headers_check, timeout=3)
+                                                if rclaim and rclaim.ok and rclaim.json().get('claimed'):
+                                                    threading.Thread(target=webbrowser.open, args=(full, 1)).start()
+                                                    opened = True
+                                                    break
+                                                else:
+                                                    logging.info('Popup for %s already claimed by another process', iid)
+                                                    opened = True
+                                                    break
+                                            except Exception:
+                                                # if claim fails, fall back to opening locally
+                                                threading.Thread(target=webbrowser.open, args=(full, 1)).start()
+                                                opened = True
+                                                break
+                                    time.sleep(poll_interval)
+                                    waited += poll_interval
+
+                                if not opened:
+                                    logging.info('Popup wait timed out after %ss, opening anyway for %s', max_wait, iid)
+                                    try:
+                                        rclaim = requests.post(claim_url, json={'iid': iid}, headers=headers_check, timeout=3)
+                                        if rclaim and rclaim.ok and rclaim.json().get('claimed'):
+                                            threading.Thread(target=webbrowser.open, args=(full, 1)).start()
+                                        else:
+                                            logging.info('Popup for %s already claimed by another process (timeout path)', iid)
+                                    except Exception:
+                                        threading.Thread(target=webbrowser.open, args=(full, 1)).start()
+                            except Exception:
+                                logging.exception('Error while waiting for enrichment; opening popup by default')
+                                try:
+                                    rclaim = requests.post(claim_url, json={'iid': iid}, headers=headers_check, timeout=3)
+                                    if rclaim and rclaim.ok and rclaim.json().get('claimed'):
+                                        threading.Thread(target=webbrowser.open, args=(full, 1)).start()
+                                    else:
+                                        logging.info('Popup for %s already claimed by another process (exception path)', iid)
+                                except Exception:
+                                    threading.Thread(target=webbrowser.open, args=(full, 1)).start()
 
                     # spawn background enrichment (non-blocking)
                     if iid:
@@ -390,6 +484,58 @@ RETURN n AS node, collect(DISTINCT m) AS messages, collect(DISTINCT c) AS commen
                 record = result.single()
                 if record:
                     return self._record_to_dict(record)
+
+            # Additional relaxed fallback: split the search text into tokens and
+            # try to match Issue.summary using CONTAINS against any token. This
+            # helps short prompts like "BR issues" where the generic fulltext
+            # search may miss label-specific fields.
+            try:
+                toks = [t for t in re.split(r"\W+", text or "") if len(t) > 1]
+                if toks:
+                    cypher3 = """
+MATCH (i:Issue)
+WHERE any(tok IN $tokens WHERE toLower(i.summary) CONTAINS toLower(tok))
+OPTIONAL MATCH (i)<-[:ON_ISSUE|REPORTED|POSTED]-(m:Message)
+OPTIONAL MATCH (i)-[:WROTE_COMMENT]->(c:Comment)
+OPTIONAL MATCH (i)-[:IN_PROJECT]->(proj:Project)
+OPTIONAL MATCH (page:Page) WHERE page.url CONTAINS head($tokens) OR toLower(page.body) CONTAINS toLower(head($tokens))
+RETURN i AS issue, collect(DISTINCT m) AS messages, collect(DISTINCT c) AS comments, collect(DISTINCT proj) AS projects, collect(DISTINCT page) AS pages LIMIT 1
+"""
+                    result = session.run(cypher3, tokens=toks)
+                    record = result.single()
+                    if record:
+                        return self._record_to_dict(record)
+            except Exception:
+                # best-effort fallback; ignore any errors and continue
+                logging.exception('Relaxed summary token search failed')
+
+                # Final fallback: try to return multiple Issue matches (up to 5)
+                try:
+                    toks = [t for t in re.split(r"\W+", text or "") if len(t) > 1]
+                    if toks:
+                        cypher_multi = """
+    MATCH (i:Issue)
+    WHERE any(tok IN $tokens WHERE toLower(i.summary) CONTAINS toLower(tok))
+    RETURN i LIMIT $limit
+    """
+                        limit = 5
+                        res = session.run(cypher_multi, tokens=toks, limit=limit)
+                        rows = []
+                        for r in res:
+                            node = r.get('i') or r.get('issue') or list(r.values())[0]
+                            try:
+                                props = dict(node._properties) if hasattr(node, '_properties') else dict(node)
+                            except Exception:
+                                try:
+                                    props = dict(node)
+                                except Exception:
+                                    props = {'repr': str(node)}
+                            rows.append({'i': props})
+                        if rows:
+                            # return shape indicating multiple rows found
+                            return {'mcp_rows': rows}
+                except Exception:
+                    logging.exception('Multi-match Issue search failed')
 
         return None
 

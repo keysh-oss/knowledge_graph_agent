@@ -15,60 +15,141 @@
 </head>
 <body>
   <div class="card">
-    <h1>{{ incident.title }}</h1>
-    <p class="small">Message: {{ incident.message }}</p>
+  <h1>{{ incident.title }}</h1>
+  {# prefer several possible locations for the incoming slack/incident text so the popup shows something sensible immediately #}
+  {% set top_message = incident.get('message') or incident.get('description') or (incident.get('data') and incident.get('data').get('message')) or (incident.get('slack') and incident.get('slack').get('text')) or '' %}
+  <p class="small">Message: <span id="incident-message">{{ top_message }}</span></p>
+  <div class="section" id="incident-details-top">
+    <h4>Incident details</h4>
+    <div id="incident-details-json">
+      <div><strong>Message</strong>: {{ top_message }}</div>
+      <div><strong>Slack</strong>: {% if incident.get('slack') %}{{ incident.get('slack').get('user') or incident.get('slack').get('username') or incident.get('slack') | tojson }}{% else %}n/a{% endif %}</div>
+      <div><strong>Cypher</strong>: {{ incident.get('cypher') or (incident.get('data') and incident.get('data').get('cypher')) or 'n/a' }}</div>
+      <div><strong>Neo4j rows</strong>: {% if incident.get('neo4j_result') %}{{ incident.get('neo4j_result')|length }} rows{% else %}{% if incident.get('mcp_result') %}{{ incident.get('mcp_result')|length }} rows{% else %}0{% endif %}{% endif %}</div>
+    </div>
+  </div>
     <p class="small">Last update: <span id="last-updated">now</span></p>
 
-    {% if incident.found %}
-    <div class="section">
+    {% if incident.found or incident.mcp or incident.mcp_result or incident.data %}
+    {# normalize incident.data into incident_data to avoid Jinja Undefined errors #}
+    {% set incident_data = incident.get('data') or {} %}
+    {% set msgs = incident_data.get('messages') or [] %}
+    {% set comments = incident_data.get('comments') or [] %}
+    {% set pages = incident_data.get('pages') or [] %}
+    {% set projects = incident_data.get('projects') or [] %}
+    {% set issue_block = incident_data.get('issue') or None %}
+    {% set incident_mcp = incident.get('mcp') %}
+    {% set kg = incident_mcp.get('graph') if incident_mcp else (incident_data.get('graph') if incident_data else {'nodes': [], 'edges': []}) %}
+
+    <div class="section" id="issue-section">
       <h3>Issue / Node</h3>
-      <pre>{{ incident.data.issue | tojson(indent=2) }}</pre>
+  <div id="issue-data">
+      {% set rows = incident.get('mcp_result') or (incident.get('neo4j_result') if (incident.get('neo4j_result') is sequence) else None) or (incident_data.get('mcp_rows') if incident_data and incident_data.get('mcp_rows') else None) %}
+      {% if issue_block %}
+      <div><strong>{{ issue_block.get('key') or issue_block.get('id') or '' }}</strong> — {{ issue_block.get('summary') }}</div>
+      <div class="small">Status: {{ issue_block.get('status') }}</div>
+      {% elif rows %}
+        <ul>
+        {% for row in rows %}
+          {% set node = (row.get('i') if (row is mapping and row.get('i')) else (row.get('n') if (row is mapping and row.get('n')) else (row if row is mapping else {}))) %}
+          {% set key = (node.get('key') or node.get('id') or node.get('title')) if node is mapping else (row.get('key') if row is mapping else (row if row is string else 'item')) %}
+          {% set summary = (node.get('summary') or node.get('label') or node.get('title')) if node is mapping else '' %}
+          <li>
+            {% if key %}
+              <a href="{{ (node.get('url') if node is mapping else '#') }}" target="_blank">{{ key }}</a>
+            {% else %}
+              <span>{{ key }}</span>
+            {% endif %}
+             — {{ summary }} <span class="small">({{ (node.get('status') if node is mapping else '') or '' }})</span>
+          </li>
+        {% endfor %}
+        </ul>
+    {% else %}
+      <p class="small">No issue data available</p>
+    {% endif %}
+  </div>
     </div>
 
-    <div class="section">
+    <div class="section" id="messages-section">
       <h3>Messages</h3>
-      {% if incident.data.messages|length == 0 %}
+      <div id="messages-list">
+      {% if msgs|length == 0 %}
         <p class="small">No related messages found.</p>
       {% else %}
-        {% for m in incident.data.messages %}
-          <pre>{{ m | tojson(indent=2) }}</pre>
+        <ul>
+        {% for m in msgs %}
+          {# prefer common text fields from Slack or similar sources #}
+          {% set text = (m.get('text') if m is mapping else None) or (m.get('body') if m is mapping else None) or (m.get('message') if m is mapping else None) %}
+          <li>
+            {% if text %}
+              <div>{{ text }}</div>
+              <div class="small">Source: {{ m.get('source') or m.get('channel') or m.get('user') or '' }}</div>
+            {% else %}
+              <pre>{{ m | tojson(indent=2) }}</pre>
+            {% endif %}
+          </li>
         {% endfor %}
+        </ul>
       {% endif %}
+      </div>
     </div>
 
-    <div class="section">
+    <div class="section" id="comments-section">
       <h3>Comments</h3>
-      {% if incident.data.comments|length == 0 %}
+      <div id="comments-list">
+      {% if comments|length == 0 %}
         <p class="small">No comments found.</p>
       {% else %}
-        {% for c in incident.data.comments %}
-          <pre>{{ c | tojson(indent=2) }}</pre>
+        <ul>
+        {% for c in comments %}
+          {% set ctext = (c.get('body') if c is mapping else None) or (c.get('text') if c is mapping else None) or (c.get('comment') if c is mapping else None) %}
+          <li>
+            {% if ctext %}
+              <div>{{ ctext }}</div>
+              <div class="small">By: {{ c.get('author') or c.get('user') or '' }}</div>
+            {% else %}
+              <pre>{{ c | tojson(indent=2) }}</pre>
+            {% endif %}
+          </li>
         {% endfor %}
+        </ul>
       {% endif %}
+      </div>
     </div>
 
-    <div class="section">
+    <div class="section" id="pages-section">
       <h3>Pages</h3>
-      {% if incident.data.pages|length == 0 %}
+      <div id="pages-list">
+      {% if pages|length == 0 %}
         <p class="small">No linked pages found.</p>
       {% else %}
-        {% for p in incident.data.pages %}
-          <pre>{{ p | tojson(indent=2) }}</pre>
+        <ul>
+        {% for p in pages %}
+          <li>
+            <a href="{{ p.get('url') or p.get('_links') and p.get('_links').get('self') or '#' }}" target="_blank">{{ p.get('title') or p.get('name') or 'page' }}</a>
+            <div class="small">{{ p.get('excerpt') or p.get('summary') or (p.get('body') and p.get('body').get('storage') and p.get('body').get('storage')[:200]) or '' }}</div>
+          </li>
         {% endfor %}
+        </ul>
       {% endif %}
+      </div>
     </div>
 
-    <div class="section">
+    <div class="section" id="projects-section">
       <h3>Projects</h3>
-      {% if incident.data.projects|length == 0 %}
+      <div id="projects-list">
+      {% if projects|length == 0 %}
         <p class="small">No linked projects found.</p>
       {% else %}
-        {% for pr in incident.data.projects %}
-          <pre>{{ pr | tojson(indent=2) }}</pre>
+        <ul>
+        {% for pr in projects %}
+          <li>{{ pr.get('key') or pr.get('id') or pr.get('name') }} - <span class="small">{{ pr.get('description') or '' }}</span></li>
         {% endfor %}
+        </ul>
       {% endif %}
+      </div>
     </div>
-  {% if incident.mcp or (incident.data and incident.data.graph) %}
+  {% if incident_mcp or (incident_data and incident_data.get('graph')) %}
     <div class="section">
       <h3>Related knowledge graph</h3>
       <div style="display:flex;gap:16px;">
@@ -85,7 +166,7 @@
         </div>
       </div>
       <script src="https://unpkg.com/vis-network@9.1.2/dist/vis-network.min.js"></script>
-      {% set kg = incident.mcp.graph if incident.mcp else (incident.data.graph if incident.data else {'nodes': [], 'edges': []}) %}
+  {# kg already computed above as a normalized graph variable #}
       <script>
         // prefer MCP graph if present (kg computed by Jinja above)
         var kg = JSON.parse('{{ kg | tojson | escapejs }}');
@@ -262,6 +343,95 @@
                 sr.innerHTML = '<p class="small">No suggested resolution yet.</p>';
               }
             }
+            // Update issue / node display (render as human-readable text/list)
+            try{
+              var issueEl = document.getElementById('issue-data');
+              var issueObj = (data.data && data.data.issue) ? data.data.issue : (data.issue);
+              if((!issueObj || (Array.isArray(issueObj) && issueObj.length===0)) && Array.isArray(data.mcp_result) && data.mcp_result.length>0){
+                issueObj = data.mcp_result;
+              }
+              if(!issueObj && data.mcp_result && data.mcp_result.issue){
+                issueObj = data.mcp_result.issue;
+              }
+              if(issueEl){
+                if(Array.isArray(issueObj)){
+                  var html = ['<ul>'];
+                  issueObj.forEach(function(row){
+                    var node = row.i || row.n || row || {};
+                    var url = node.url || '#';
+                    var key = node.key || node.id || node.title || '';
+                    var summary = node.summary || node.label || node.title || '';
+                    var status = node.status ? (' <span class="small">(' + node.status + ')</span>') : '';
+                    html.push('<li><a href="'+url+'" target="_blank">'+escapeHtml(key)+'</a> — '+escapeHtml(summary)+status+'</li>');
+                  });
+                  html.push('</ul>');
+                  issueEl.innerHTML = html.join('');
+                } else if(issueObj && typeof issueObj === 'object'){
+                  var key = issueObj.key || issueObj.id || '';
+                  var summary = issueObj.summary || issueObj.title || '';
+                  var status = issueObj.status ? (' <span class="small">(' + issueObj.status + ')</span>') : '';
+                  issueEl.innerHTML = '<div><strong>'+escapeHtml(key)+'</strong> — '+escapeHtml(summary)+'</div>' + '<div class="small">Status: '+ (issueObj.status||'') +'</div>';
+                } else {
+                  issueEl.innerHTML = '<p class="small">No issue data available</p>';
+                }
+              }
+            }catch(e){/* ignore */}
+
+            // Update the visible message/description if present
+            try{
+              var msgEl = document.getElementById('incident-message');
+              if(msgEl){ msgEl.textContent = data.message || data.description || msgEl.textContent; }
+            }catch(e){}
+
+            // helper: render items as human-readable lists (fall back to JSON)
+            function renderJsonItems(el, items){
+              if(!el) return;
+              if(!items || items.length === 0){ el.innerHTML = '<p class="small">No items found.</p>'; return; }
+              var html = ['<ul>'];
+              items.forEach(function(it){
+                if(!it){ return; }
+                if(typeof it === 'string'){
+                  html.push('<li>'+escapeHtml(it)+'</li>');
+                  return;
+                }
+                var text = it.text || (it.body && (it.body.storage || it.body.value || it.body.text)) || it.message || it.comment || it.summary || it.excerpt || '';
+                var meta = it.user || it.author || it.source || it.channel || '';
+                if(text){
+                  html.push('<li>'+escapeHtml(text)+'<div class="small">'+escapeHtml(meta)+'</div></li>');
+                } else {
+                  html.push('<li><pre>'+escapeHtml(JSON.stringify(it, null, 2))+'</pre></li>');
+                }
+              });
+              html.push('</ul>');
+              el.innerHTML = html.join('');
+            }
+
+            // Update messages/comments/pages/projects sections
+            var msgs = document.getElementById('messages-list');
+            if(msgs) renderJsonItems(msgs, (data.data && data.data.messages) || data.messages || []);
+            var cms = document.getElementById('comments-list');
+            if(cms) renderJsonItems(cms, (data.data && data.data.comments) || data.comments || []);
+            var pls = document.getElementById('pages-list');
+            if(pls) renderJsonItems(pls, (data.data && data.data.pages) || data.pages || []);
+            var prs = document.getElementById('projects-list');
+            if(prs) renderJsonItems(prs, (data.data && data.data.projects) || data.projects || []);
+
+            // Update knowledge graph (if new graph present in response)
+            try{
+              var newKg = null;
+              if(data.mcp && data.mcp.graph) newKg = data.mcp.graph;
+              else if(data.mcp_result && data.mcp_result.graph) newKg = data.mcp_result.graph;
+              else if(data.data && data.data.graph) newKg = data.data.graph;
+              if(newKg){
+                // replace nodes/edges in existing vis DataSets
+                if(typeof nodes !== 'undefined' && typeof edges !== 'undefined'){
+                  nodes.clear();
+                  edges.clear();
+                  (newKg.nodes || []).forEach(function(n){ nodes.add({id:n.id, label:n.label, title: JSON.stringify(n.props, null, 2), _props: n.props}); });
+                  (newKg.edges || []).forEach(function(e){ edges.add({from:e.from, to:e.to, label:e.label}); });
+                }
+              }
+            }catch(e){ /* ignore graph update errors */ }
           }catch(e){ /* ignore transient errors */ }
         }
 
