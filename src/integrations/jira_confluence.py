@@ -119,8 +119,8 @@ def query_jira_with_llm(cfg: Dict, incident_text: str, max_results: int = 50) ->
 
         # If we don't have LLM available, fall back to a heuristic JQL
         if not OPENAI_API_KEY or OpenAI is None:
-            # prev day: updated between prev_str and next_str
-            prev_jql = f'updated >= "{prev_str}" AND updated < "{next_str}"'
+            # prev day: issues with Start Date on the previous day
+            prev_jql = f'"Start Date" >= "{prev_str}" AND "Start Date" < "{next_str}"'
             related_jql = None
             # try to use incident_text for basic text search
             safe = incident_text.replace('"', '')[:200]
@@ -131,15 +131,13 @@ def query_jira_with_llm(cfg: Dict, incident_text: str, max_results: int = 50) ->
 
         # Build prompt for LLM to produce two JQL queries in JSON
         prompt = (
-            "You are a helpful assistant that generates Jira JQL queries."
-        )
-        prompt += (
-            f"\nGiven this incident description:\n{incident_text}\n\n"
-            "Produce a JSON object with two fields: \n"
-            " - prev_day_jql: a JQL query that selects issues that were executed/updated during the previous UTC day (use >= and < with dates in YYYY/MM/DD format).\n"
-            " - related_jql: a JQL query that finds issues related to the incident text (by summary, description, or linked issues).\n"
-            f"Use the previous day start date: {prev_str} (UTC) and end date: {next_str} (UTC).\n"
-            "Return JSON ONLY."
+            "You are a helpful assistant that generates Jira JQL queries. "
+            "Return ONLY a valid JSON object with no additional text or markdown.\n\n"
+            f"Given this incident description:\n{incident_text}\n\n"
+            "Produce a JSON object with two fields:\n"
+            f'- "prev_day_jql": a JQL query using the custom field "Start Date" to find issues started on {prev_str}. Example: \'"Start Date" >= "{prev_str}" AND "Start Date" < "{next_str}"\'\n'
+            '- "related_jql": a JQL query to find issues related to the incident by summary or description text.\n\n'
+            "Return JSON ONLY, no markdown code blocks."
         )
 
         try:
@@ -160,6 +158,13 @@ def query_jira_with_llm(cfg: Dict, incident_text: str, max_results: int = 50) ->
             if not content:
                 content = (resp.get("choices", [])[0].get("message", {}).get("content", "") if isinstance(resp, dict) else "")
             content = (content or "").strip()
+            
+            # Remove markdown code blocks if present
+            import re
+            code_block_match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', content)
+            if code_block_match:
+                content = code_block_match.group(1).strip()
+            
             # extract JSON object
             start = content.find("{")
             end = content.rfind("}")
@@ -167,14 +172,18 @@ def query_jira_with_llm(cfg: Dict, incident_text: str, max_results: int = 50) ->
                 json_text = content[start:end+1]
             else:
                 json_text = content
+            
+            logger.debug(f"LLM JQL response: {json_text[:500]}")
             parsed = json.loads(json_text)
             prev_jql = parsed.get('prev_day_jql')
             related_jql = parsed.get('related_jql')
+            logger.info(f"Generated JQL - prev_day: {prev_jql}, related: {related_jql}")
         except Exception:
             logger.exception("LLM failed to produce JQL; falling back to heuristics")
-            prev_jql = f'updated >= "{prev_str}" AND updated < "{next_str}"'
+            prev_jql = f'"Start Date" >= "{prev_str}" AND "Start Date" < "{next_str}"'
             safe = incident_text.replace('"', '')[:200]
             related_jql = f'text ~ "{safe}" OR summary ~ "{safe}"'
+            logger.info(f"Fallback JQL - prev_day: {prev_jql}, related: {related_jql}")
 
         results = {"prev_day": [], "related": []}
         # run prev_jql
@@ -234,7 +243,7 @@ def _run_jira_jql(cfg: Dict, jql: str, max_results: int = 50) -> List[Dict]:
             return []
 
 
-def query_confluence(cfg: Dict, query: Optional[str] = None, jira_keys: Optional[List[str]] = None, max_results: int = 6) -> List[Dict]:
+def query_confluence(cfg: Dict, query: Optional[str] = None, jira_keys: Optional[List[str]] = None, max_results: int = 20) -> List[Dict]:
     """Search Confluence pages by CQL (simple wrapper). Returns list of pages with title, id, url, excerpt.
 
     This function uses the Confluence REST API `/rest/api/content/search` with a CQL query.
@@ -258,7 +267,7 @@ def query_confluence(cfg: Dict, query: Optional[str] = None, jira_keys: Optional
         return []
 
     url = base.rstrip("/") + "/rest/api/content/search"
-    params = {"cql": cql, "limit": max_results, "expand": "space,body.view"}
+    params = {"cql": cql, "limit": max_results, "expand": "space,body.view,_links"}
     try:
         r = requests.get(url, params=params, headers=headers, auth=auth, timeout=8)
         if r.status_code != 200:
@@ -266,20 +275,53 @@ def query_confluence(cfg: Dict, query: Optional[str] = None, jira_keys: Optional
             return []
         data = r.json()
         pages = []
+        # Get base URL from response _links.base (e.g., https://instance.atlassian.net/wiki)
+        # This is the authoritative base for constructing page URLs
+        api_base = data.get("_links", {}).get("base")
+        if not api_base:
+            # Fallback: use configured base_url
+            api_base = base.rstrip("/")
+        
         for it in data.get("results", []):
             page_id = it.get("id")
             title = it.get("title")
-            space = (it.get("space") or {}).get("key")
+            space_obj = it.get("space") or {}
+            space_key = space_obj.get("key")
+            space_name = space_obj.get("name")
             body = (it.get("body") or {}).get("view", {}).get("value")
             # produce a short excerpt by stripping tags naively
             excerpt = None
             if body:
                 # crude strip of HTML tags
-                excerpt = body.replace('<', ' <')
+                import re
+                excerpt = re.sub(r'<[^>]+>', ' ', body)
                 # take first 400 chars
-                excerpt = (excerpt or '')[:400]
-            url_page = base.rstrip("/") + "/pages/" + page_id if page_id else None
-            pages.append({"id": page_id, "title": title, "space": space, "excerpt": excerpt, "url": url_page})
+                excerpt = (excerpt or '')[:400].strip()
+            
+            # Build proper Confluence URL - prefer _links.webui from API response
+            links = it.get("_links") or {}
+            webui = links.get("webui")  # e.g., /spaces/SPACE/pages/12345/Page+Title
+            if webui:
+                # webui is a relative path, prepend the base URL from API response
+                # api_base is already the full base (e.g., https://instance.atlassian.net/wiki)
+                url_page = api_base + webui
+            elif page_id and space_key:
+                # Construct URL: {base}/spaces/{space}/pages/{id}
+                url_page = api_base + f"/spaces/{space_key}/pages/{page_id}"
+            elif page_id:
+                # Fallback: use Confluence viewpage endpoint
+                url_page = api_base + f"/pages/viewpage.action?pageId={page_id}"
+            else:
+                url_page = None
+            
+            pages.append({
+                "id": page_id, 
+                "title": title, 
+                "space": {"key": space_key, "name": space_name} if space_key else None,
+                "excerpt": excerpt, 
+                "url": url_page,
+                "_links": links  # preserve links for template
+            })
         return pages
     except Exception:
         logger.exception("Error querying Confluence")
@@ -287,37 +329,52 @@ def query_confluence(cfg: Dict, query: Optional[str] = None, jira_keys: Optional
 
 
 def summarize_with_llm(jira_items: List[Dict], conf_pages: List[Dict], incident_text: Optional[str] = None) -> Dict:
-    """Call an LLM to synthesize probable cause and resolution steps from Jira/Confluence results.
+    """Call an LLM to synthesize probable causes and resolution steps from Jira/Confluence results.
 
-    Returns: {probable_cause: str, resolution_steps: [str], confidence: float}
+    Returns: {probable_causes: [str], resolution_steps: [str], confidence: float}
     If OPENAI_API_KEY is not present or client missing, returns a best-effort heuristic summary.
     """
     if not OPENAI_API_KEY or OpenAI is None:
-        # fallback: minimal heuristic summary
-        cause = None
+        # fallback: minimal heuristic summary - include ALL items
+        causes = []
         steps = []
         if len(jira_items) > 0:
-            cause = f"Related Jira issues: {', '.join([i.get('key') for i in jira_items[:5]])}"
+            # Add each Jira issue as a potential cause
+            for item in jira_items:
+                causes.append(f"Related Jira issue {item.get('key')}: {item.get('summary')}")
             steps.append("Review linked Jira issues and their comments for root cause.")
+            steps.append("Check issue history and related tickets for patterns.")
+            steps.append("Verify if similar issues were resolved before.")
         if len(conf_pages) > 0:
-            if not cause:
-                cause = f"Related Confluence pages found: {', '.join([p.get('title') for p in conf_pages[:3]])}"
+            # Add Confluence pages as sources
+            for page in conf_pages:
+                causes.append(f"See Confluence page: {page.get('title')}")
             steps.append("Check Confluence runbooks and known-issues pages for remediation steps.")
-        return {"probable_cause": cause, "resolution_steps": steps, "confidence": 0.2}
+            steps.append("Review documentation for troubleshooting procedures.")
+        return {"probable_causes": causes, "resolution_steps": steps, "confidence": 0.2}
 
-    # Build a concise prompt
+    # Build a concise prompt - include ALL items (up to reasonable limit to avoid token overflow)
     snippets = []
     if incident_text:
         snippets.append(f"Incident text: {incident_text}\n")
     if jira_items:
-        snippets.append("Jira issues:\n" + "\n".join([f"- {i.get('key')}: {i.get('summary')} (status={i.get('status')})" for i in jira_items[:6]]))
+        # Include all Jira items (up to 20 to avoid token overflow)
+        jira_list = [f"- {i.get('key')}: {i.get('summary')} (status={i.get('status')})" for i in jira_items[:20]]
+        snippets.append("Jira issues:\n" + "\n".join(jira_list))
     if conf_pages:
-        snippets.append("Confluence pages:\n" + "\n".join([f"- {p.get('title')}: {p.get('url') or ''}" for p in conf_pages[:6]]))
+        # Include all Confluence pages (up to 15 to avoid token overflow)
+        conf_list = [f"- {p.get('title')}: {p.get('url') or ''}" for p in conf_pages[:15]]
+        snippets.append("Confluence pages:\n" + "\n".join(conf_list))
 
     prompt = (
-        "You are an SRE assistant. Given the incident text, related Jira issues and Confluence pages, "
-        "provide a short probable cause (1-2 sentences) and 3 concise, ordered resolution steps. "
-        "Return JSON only with keys: probable_cause (string), resolution_steps (array of strings), confidence (0-1).\n\n"
+        "You are an SRE assistant analyzing an incident. Given the incident text, related Jira issues and Confluence pages:\n\n"
+        "1. Identify ALL probable causes (not just one). List each cause separately.\n"
+        "2. Provide ALL applicable resolution steps - do NOT limit to 3 steps. Include every actionable step needed.\n"
+        "3. Be comprehensive - if there are 10 relevant steps, include all 10.\n\n"
+        "Return JSON with keys:\n"
+        "- probable_causes: array of strings (ALL identified causes)\n"
+        "- resolution_steps: array of strings (ALL steps, not limited)\n"
+        "- confidence: number 0-1\n\n"
         + "\n\n".join(snippets)
     )
 
@@ -326,7 +383,7 @@ def summarize_with_llm(jira_items: List[Dict], conf_pages: List[Dict], incident_
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=300,
+            max_tokens=1000,  # Increased to allow more resolution steps
             temperature=0.0,
         )
         content = None

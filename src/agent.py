@@ -104,6 +104,10 @@ class IncidentAgent:
         self._opened_iids = set()
         # lock to make check-and-add atomic across threads in this process
         self._opened_iids_lock = threading.Lock()
+        # track Slack message ts values that have been processed to prevent
+        # race condition re-processing within a single agent process
+        self._processed_ts = set()
+        self._processed_ts_lock = threading.Lock()
 
     def start(self):
         logging.info("Starting IncidentAgent")
@@ -184,6 +188,16 @@ class IncidentAgent:
         text = msg.get("text", "")
         user = msg.get("user")
         ts = msg.get("ts")
+
+        # Dedupe: skip if this exact Slack message (by ts) was already processed
+        # by this agent instance. This prevents race conditions where the same
+        # message might be picked up by concurrent poll cycles.
+        if ts:
+            with self._processed_ts_lock:
+                if ts in self._processed_ts:
+                    logging.debug("Skipping already-processed message ts=%s", ts)
+                    return
+                self._processed_ts.add(ts)
 
         logging.info("Processing message in %s @%s: %s", channel_id, ts, text[:200])
 
@@ -323,8 +337,15 @@ class IncidentAgent:
                 headers['X-API-KEY'] = ui_key
             r = requests.post(self.web_endpoint, json=incident_payload, timeout=5, headers=headers)
             if r.status_code == 200:
+                resp_json = r.json()
+                # Check if server indicates this is a dedupe (same Slack message
+                # already created an incident). If so, skip opening a popup.
+                if resp_json.get("dedupe"):
+                    logging.info("Server dedupe: incident already exists for this Slack message")
+                    return
+
                 # open popup in browser
-                pop_url = r.json().get("popup_url")
+                pop_url = resp_json.get("popup_url")
                 if pop_url:
                     # prefer opening the launcher URL which uses JS to open a new
                     # browser window with features (size/chrome) and then closes
@@ -456,7 +477,7 @@ OPTIONAL MATCH (issue)<-[:ON_ISSUE|REPORTED|POSTED]-(m:Message)
 OPTIONAL MATCH (issue)-[:WROTE_COMMENT]->(c:Comment)
 OPTIONAL MATCH (issue)-[:IN_PROJECT]->(proj:Project)
 OPTIONAL MATCH (page:Page) WHERE page.url CONTAINS $jira_key OR toLower(page.body) CONTAINS toLower($jira_key)
-RETURN issue, collect(DISTINCT m) AS messages, collect(DISTINCT c) AS comments, collect(DISTINCT proj) AS projects, collect(DISTINCT page) AS pages LIMIT 1
+RETURN issue, collect(DISTINCT m) AS messages, collect(DISTINCT c) AS comments, collect(DISTINCT proj) AS projects, collect(DISTINCT page) AS pages
 """
                 result = session.run(cypher, jira_key=jira_key)
                 record = result.single()
@@ -466,24 +487,22 @@ RETURN issue, collect(DISTINCT m) AS messages, collect(DISTINCT c) AS comments, 
             # fallback: try to match by fulltext (adjust to your schema)
             if text:
                 cypher2 = """
-CALL {
-  WITH $text AS q
-  MATCH (n)
-  WHERE (n:Issue AND (toLower(n.summary) CONTAINS toLower(q) OR toLower(n.key) CONTAINS toLower(q)))
-     OR (n:Page AND (toLower(n.title) CONTAINS toLower(q) OR toLower(n.body) CONTAINS toLower(q)))
-     OR (n:Message AND toLower(n.text) CONTAINS toLower(q))
-  RETURN n LIMIT 1
-}
+MATCH (n)
+WHERE (n:Issue AND (toLower(n.summary) CONTAINS toLower($text) OR toLower(n.key) CONTAINS toLower($text)))
+   OR (n:Page AND (toLower(n.title) CONTAINS toLower($text) OR toLower(n.body) CONTAINS toLower($text)))
+   OR (n:Message AND toLower(n.text) CONTAINS toLower($text))
+WITH n LIMIT 20
 OPTIONAL MATCH (n)<-[:ON_ISSUE|REPORTED|POSTED]-(m:Message)
 OPTIONAL MATCH (n)-[:WROTE_COMMENT]->(c:Comment)
 OPTIONAL MATCH (n)-[:IN_PROJECT]->(proj:Project)
 OPTIONAL MATCH (page:Page) WHERE page.url CONTAINS $text OR toLower(page.body) CONTAINS toLower($text)
-RETURN n AS node, collect(DISTINCT m) AS messages, collect(DISTINCT c) AS comments, collect(DISTINCT proj) AS projects, collect(DISTINCT page) AS pages LIMIT 1
+RETURN n AS node, collect(DISTINCT m) AS messages, collect(DISTINCT c) AS comments, collect(DISTINCT proj) AS projects, collect(DISTINCT page) AS pages
 """
                 result = session.run(cypher2, text=text)
-                record = result.single()
-                if record:
-                    return self._record_to_dict(record)
+                records = list(result)
+                if records:
+                    # Return multiple results
+                    return self._records_to_dict(records)
 
             # Additional relaxed fallback: split the search text into tokens and
             # try to match Issue.summary using CONTAINS against any token. This
@@ -495,47 +514,20 @@ RETURN n AS node, collect(DISTINCT m) AS messages, collect(DISTINCT c) AS commen
                     cypher3 = """
 MATCH (i:Issue)
 WHERE any(tok IN $tokens WHERE toLower(i.summary) CONTAINS toLower(tok))
+WITH i LIMIT 20
 OPTIONAL MATCH (i)<-[:ON_ISSUE|REPORTED|POSTED]-(m:Message)
 OPTIONAL MATCH (i)-[:WROTE_COMMENT]->(c:Comment)
 OPTIONAL MATCH (i)-[:IN_PROJECT]->(proj:Project)
 OPTIONAL MATCH (page:Page) WHERE page.url CONTAINS head($tokens) OR toLower(page.body) CONTAINS toLower(head($tokens))
-RETURN i AS issue, collect(DISTINCT m) AS messages, collect(DISTINCT c) AS comments, collect(DISTINCT proj) AS projects, collect(DISTINCT page) AS pages LIMIT 1
+RETURN i AS issue, collect(DISTINCT m) AS messages, collect(DISTINCT c) AS comments, collect(DISTINCT proj) AS projects, collect(DISTINCT page) AS pages
 """
                     result = session.run(cypher3, tokens=toks)
-                    record = result.single()
-                    if record:
-                        return self._record_to_dict(record)
+                    records = list(result)
+                    if records:
+                        return self._records_to_dict(records)
             except Exception:
                 # best-effort fallback; ignore any errors and continue
                 logging.exception('Relaxed summary token search failed')
-
-                # Final fallback: try to return multiple Issue matches (up to 5)
-                try:
-                    toks = [t for t in re.split(r"\W+", text or "") if len(t) > 1]
-                    if toks:
-                        cypher_multi = """
-    MATCH (i:Issue)
-    WHERE any(tok IN $tokens WHERE toLower(i.summary) CONTAINS toLower(tok))
-    RETURN i LIMIT $limit
-    """
-                        limit = 5
-                        res = session.run(cypher_multi, tokens=toks, limit=limit)
-                        rows = []
-                        for r in res:
-                            node = r.get('i') or r.get('issue') or list(r.values())[0]
-                            try:
-                                props = dict(node._properties) if hasattr(node, '_properties') else dict(node)
-                            except Exception:
-                                try:
-                                    props = dict(node)
-                                except Exception:
-                                    props = {'repr': str(node)}
-                            rows.append({'i': props})
-                        if rows:
-                            # return shape indicating multiple rows found
-                            return {'mcp_rows': rows}
-                except Exception:
-                    logging.exception('Multi-match Issue search failed')
 
         return None
 
@@ -661,6 +653,66 @@ RETURN i AS issue, collect(DISTINCT m) AS messages, collect(DISTINCT c) AS comme
         projects = [dict(n._properties) for n in record.get("projects", [])]
         pages = [dict(n._properties) for n in record.get("pages", [])]
         return {"issue": node_props, "messages": messages, "comments": comments, "projects": projects, "pages": pages}
+
+    def _records_to_dict(self, records):
+        """Convert multiple Neo4j records to a dict with lists of issues and related data."""
+        issues = []
+        all_messages = []
+        all_comments = []
+        all_projects = []
+        all_pages = []
+        
+        for record in records:
+            issue_node = record.get("issue") or record.get("node")
+            if issue_node:
+                try:
+                    node_props = dict(issue_node._properties) if hasattr(issue_node, '_properties') else dict(issue_node)
+                    issues.append(node_props)
+                except Exception:
+                    pass
+            
+            for m in record.get("messages", []):
+                try:
+                    props = dict(m._properties) if hasattr(m, '_properties') else dict(m)
+                    if props not in all_messages:
+                        all_messages.append(props)
+                except Exception:
+                    pass
+            
+            for c in record.get("comments", []):
+                try:
+                    props = dict(c._properties) if hasattr(c, '_properties') else dict(c)
+                    if props not in all_comments:
+                        all_comments.append(props)
+                except Exception:
+                    pass
+            
+            for p in record.get("projects", []):
+                try:
+                    props = dict(p._properties) if hasattr(p, '_properties') else dict(p)
+                    if props not in all_projects:
+                        all_projects.append(props)
+                except Exception:
+                    pass
+            
+            for pg in record.get("pages", []):
+                try:
+                    props = dict(pg._properties) if hasattr(pg, '_properties') else dict(pg)
+                    if props not in all_pages:
+                        all_pages.append(props)
+                except Exception:
+                    pass
+        
+        # Return first issue for backward compatibility, but also include all issues
+        result = {
+            "issue": issues[0] if issues else None,
+            "issues": issues,
+            "messages": all_messages,
+            "comments": all_comments,
+            "projects": all_projects,
+            "pages": all_pages
+        }
+        return result
 
 
 if __name__ == "__main__":

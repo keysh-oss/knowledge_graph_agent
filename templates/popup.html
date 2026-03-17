@@ -11,62 +11,147 @@
     .section { margin-top: 12px; }
     pre { background:#f6f6f6; padding:8px; border-radius:4px; overflow:auto }
     .small { color: #666; font-size: 0.9em }
+    .incident-alert { background: #fff3cd; border: 1px solid #ffc107; padding: 12px; border-radius: 6px; margin-bottom: 16px; }
+    .incident-alert h3 { margin: 0 0 8px 0; color: #856404; }
+    .incident-alert .message { font-size: 1.1em; color: #333; }
   </style>
 </head>
 <body>
   <div class="card">
-  <h1>{{ incident.title }}</h1>
-  {# prefer several possible locations for the incoming slack/incident text so the popup shows something sensible immediately #}
-  {% set top_message = incident.get('message') or incident.get('description') or (incident.get('data') and incident.get('data').get('message')) or (incident.get('slack') and incident.get('slack').get('text')) or '' %}
-  <p class="small">Message: <span id="incident-message">{{ top_message }}</span></p>
-  <div class="section" id="incident-details-top">
-    <h4>Incident details</h4>
-    <div id="incident-details-json">
-      <div><strong>Message</strong>: {{ top_message }}</div>
-      <div><strong>Slack</strong>: {% if incident.get('slack') %}{{ incident.get('slack').get('user') or incident.get('slack').get('username') or incident.get('slack') | tojson }}{% else %}n/a{% endif %}</div>
-      <div><strong>Cypher</strong>: {{ incident.get('cypher') or (incident.get('data') and incident.get('data').get('cypher')) or 'n/a' }}</div>
-      <div><strong>Neo4j rows</strong>: {% if incident.get('neo4j_result') %}{{ incident.get('neo4j_result')|length }} rows{% else %}{% if incident.get('mcp_result') %}{{ incident.get('mcp_result')|length }} rows{% else %}0{% endif %}{% endif %}</div>
-    </div>
-  </div>
-    <p class="small">Last update: <span id="last-updated">now</span></p>
 
-    {% if incident.found or incident.mcp or incident.mcp_result or incident.data %}
+  {# SLACK INCIDENT MESSAGE AT THE TOP - highlighted (removed the h1 title) #}
+  {% set top_message = incident.get('message') or incident.get('description') or (incident.get('data') and incident.get('data').get('message')) or (incident.get('slack') and incident.get('slack').get('text')) or '' %}
+  <div class="incident-alert">
+    <h3>🚨 Slack Incident</h3>
+    <div class="message" id="incident-message">{{ top_message }}</div>
+    {% if incident.get('slack') %}
+    <div class="small" style="margin-top: 8px;">
+      Channel: {{ incident.get('slack').get('channel') or 'n/a' }} | 
+      User: {{ incident.get('slack').get('user') or incident.get('slack').get('username') or 'n/a' }} |
+      Time: {{ incident.get('slack').get('ts') or 'n/a' }}
+    </div>
+    {% endif %}
+  </div>
+
+  <p class="small">Last update: <span id="last-updated">now</span></p>
+
+    {% if incident.found or incident.mcp or incident.mcp_result or incident.data or incident.neo4j_query_result or incident.jira or incident.jira_prev_day or incident.confluence %}
     {# normalize incident.data into incident_data to avoid Jinja Undefined errors #}
     {% set incident_data = incident.get('data') or {} %}
     {% set msgs = incident_data.get('messages') or [] %}
     {% set comments = incident_data.get('comments') or [] %}
-    {% set pages = incident_data.get('pages') or [] %}
     {% set projects = incident_data.get('projects') or [] %}
     {% set issue_block = incident_data.get('issue') or None %}
     {% set incident_mcp = incident.get('mcp') %}
     {% set kg = incident_mcp.get('graph') if incident_mcp else (incident_data.get('graph') if incident_data else {'nodes': [], 'edges': []}) %}
 
+    {# 2. ISSUE/NODE SECTION - show ALL matching issues #}
     <div class="section" id="issue-section">
-      <h3>Issue / Node</h3>
+      <h3>Issues / Nodes from Neo4j</h3>
   <div id="issue-data">
-      {% set rows = incident.get('mcp_result') or (incident.get('neo4j_result') if (incident.get('neo4j_result') is sequence) else None) or (incident_data.get('mcp_rows') if incident_data and incident_data.get('mcp_rows') else None) %}
-      {% if issue_block %}
-      <div><strong>{{ issue_block.get('key') or issue_block.get('id') or '' }}</strong> — {{ issue_block.get('summary') }}</div>
-      <div class="small">Status: {{ issue_block.get('status') }}</div>
-      {% elif rows %}
+      {# collect ALL rows from various possible fields #}
+      {% set all_rows = [] %}
+      
+      {# From mcp_result #}
+      {% set _mcp_result = incident.get('mcp_result') %}
+      {% if _mcp_result is sequence and _mcp_result is not string and _mcp_result is not mapping %}
+        {% set all_rows = all_rows + _mcp_result %}
+      {% elif _mcp_result is mapping %}
+        {% set all_rows = all_rows + [_mcp_result] %}
+      {% endif %}
+      
+      {# From neo4j_result #}
+      {% set _neo4j_result = incident.get('neo4j_result') %}
+      {% if _neo4j_result is sequence and _neo4j_result is not string and _neo4j_result is not mapping %}
+        {% set all_rows = all_rows + _neo4j_result %}
+      {% elif _neo4j_result is mapping %}
+        {% set all_rows = all_rows + [_neo4j_result] %}
+      {% endif %}
+      
+      {# From neo4j_query_result (alternative field name) #}
+      {% set _neo4j_query_result = incident.get('neo4j_query_result') %}
+      {% if _neo4j_query_result is sequence and _neo4j_query_result is not string and _neo4j_query_result is not mapping %}
+        {% set all_rows = all_rows + _neo4j_query_result %}
+      {% elif _neo4j_query_result is mapping %}
+        {% set all_rows = all_rows + [_neo4j_query_result] %}
+      {% endif %}
+      
+      {# From mcp_rows #}
+      {% set _mcp_rows = incident.get('mcp_rows') %}
+      {% if _mcp_rows is sequence and _mcp_rows is not string and _mcp_rows is not mapping %}
+        {% set all_rows = all_rows + _mcp_rows %}
+      {% elif _mcp_rows is mapping %}
+        {% set all_rows = all_rows + [_mcp_rows] %}
+      {% endif %}
+      
+      {# From data.mcp_rows #}
+      {% set _data_mcp_rows = incident_data.get('mcp_rows') %}
+      {% if _data_mcp_rows is sequence and _data_mcp_rows is not string and _data_mcp_rows is not mapping %}
+        {% set all_rows = all_rows + _data_mcp_rows %}
+      {% elif _data_mcp_rows is mapping %}
+        {% set all_rows = all_rows + [_data_mcp_rows] %}
+      {% endif %}
+      
+      {# From data.rows #}
+      {% set _data_rows = incident_data.get('rows') %}
+      {% if _data_rows is sequence and _data_rows is not string and _data_rows is not mapping %}
+        {% set all_rows = all_rows + _data_rows %}
+      {% elif _data_rows is mapping %}
+        {% set all_rows = all_rows + [_data_rows] %}
+      {% endif %}
+      
+      {# From neo4j_rows #}
+      {% set _neo4j_rows = incident.get('neo4j_rows') %}
+      {% if _neo4j_rows is sequence and _neo4j_rows is not string and _neo4j_rows is not mapping %}
+        {% set all_rows = all_rows + _neo4j_rows %}
+      {% elif _neo4j_rows is mapping %}
+        {% set all_rows = all_rows + [_neo4j_rows] %}
+      {% endif %}
+
+      {# From neo4j_result.issues (new multi-issue format) #}
+      {% set _neo4j_issues = incident.get('neo4j_result', {}).get('issues') if incident.get('neo4j_result') is mapping else [] %}
+      {% if _neo4j_issues is sequence and _neo4j_issues is not string and _neo4j_issues is not mapping %}
+        {% for iss in _neo4j_issues %}
+          {% set all_rows = all_rows + [{'issue': iss}] %}
+        {% endfor %}
+      {% endif %}
+      
+      {# From data.issues (new multi-issue format) #}
+      {% set _data_issues = incident_data.get('issues') if incident_data is mapping else [] %}
+      {% if _data_issues is sequence and _data_issues is not string and _data_issues is not mapping %}
+        {% for iss in _data_issues %}
+          {% set all_rows = all_rows + [{'issue': iss}] %}
+        {% endfor %}
+      {% endif %}
+
+      {# Also check for issue in data.issue #}
+      {% if issue_block and issue_block is mapping %}
+        {% set all_rows = all_rows + [{'i': issue_block}] %}
+      {% endif %}
+
+      {% if all_rows and all_rows|length > 0 %}
+        <p class="small">Found {{ all_rows|length }} matching issue(s)/node(s):</p>
         <ul>
-        {% for row in rows %}
-          {% set node = (row.get('i') if (row is mapping and row.get('i')) else (row.get('n') if (row is mapping and row.get('n')) else (row if row is mapping else {}))) %}
-          {% set key = (node.get('key') or node.get('id') or node.get('title')) if node is mapping else (row.get('key') if row is mapping else (row if row is string else 'item')) %}
-          {% set summary = (node.get('summary') or node.get('label') or node.get('title')) if node is mapping else '' %}
+        {% for row in all_rows %}
+          {% set node = (row.get('i') if (row is mapping and row.get('i')) else (row.get('n') if (row is mapping and row.get('n')) else (row.get('issue') if (row is mapping and row.get('issue')) else (row.get('node') if (row is mapping and row.get('node')) else (row if row is mapping else {}))))) %}
+          {% set key = (node.get('key') or node.get('id') or node.get('title') or node.get('name')) if node is mapping else (row.get('key') if row is mapping else 'item') %}
+          {% set summary = (node.get('summary') or node.get('label') or node.get('title') or node.get('description') or node.get('name')) if node is mapping else '' %}
+          {% set status = (node.get('status')) if node is mapping else '' %}
+          {% set url = (node.get('url') or node.get('self') or node.get('link')) if node is mapping else '' %}
           <li>
-            {% if key %}
-              <a href="{{ (node.get('url') if node is mapping else '#') }}" target="_blank">{{ key }}</a>
+            {% if url %}
+              <a href="{{ url }}" target="_blank"><strong>{{ key }}</strong></a>
             {% else %}
-              <span>{{ key }}</span>
+              <strong>{{ key }}</strong>
             {% endif %}
-             — {{ summary }} <span class="small">({{ (node.get('status') if node is mapping else '') or '' }})</span>
+             — {{ summary }}
+            {% if status %}<span class="small">({{ status }})</span>{% endif %}
           </li>
         {% endfor %}
         </ul>
-    {% else %}
-      <p class="small">No issue data available</p>
-    {% endif %}
+      {% else %}
+        <p class="small">No matching issues/nodes found in Neo4j</p>
+      {% endif %}
   </div>
     </div>
 
@@ -78,16 +163,22 @@
       {% else %}
         <ul>
         {% for m in msgs %}
-          {# prefer common text fields from Slack or similar sources #}
-          {% set text = (m.get('text') if m is mapping else None) or (m.get('body') if m is mapping else None) or (m.get('message') if m is mapping else None) %}
-          <li>
-            {% if text %}
-              <div>{{ text }}</div>
-              <div class="small">Source: {{ m.get('source') or m.get('channel') or m.get('user') or '' }}</div>
-            {% else %}
-              <pre>{{ m | tojson(indent=2) }}</pre>
-            {% endif %}
-          </li>
+          {% if m is mapping %}
+            {# prefer common text fields from Slack or similar sources #}
+            {% set text = m.get('text') or m.get('body') or m.get('message') %}
+            <li>
+              {% if text %}
+                <div>{{ text }}</div>
+                <div class="small">Source: {{ m.get('source') or m.get('channel') or m.get('user') or '' }}</div>
+              {% else %}
+                <pre>{{ m | tojson(indent=2) }}</pre>
+              {% endif %}
+            </li>
+          {% elif m is string %}
+            <li>{{ m }}</li>
+          {% else %}
+            <li><pre>{{ m | tojson(indent=2) }}</pre></li>
+          {% endif %}
         {% endfor %}
         </ul>
       {% endif %}
@@ -102,33 +193,21 @@
       {% else %}
         <ul>
         {% for c in comments %}
-          {% set ctext = (c.get('body') if c is mapping else None) or (c.get('text') if c is mapping else None) or (c.get('comment') if c is mapping else None) %}
-          <li>
-            {% if ctext %}
-              <div>{{ ctext }}</div>
-              <div class="small">By: {{ c.get('author') or c.get('user') or '' }}</div>
-            {% else %}
-              <pre>{{ c | tojson(indent=2) }}</pre>
-            {% endif %}
-          </li>
-        {% endfor %}
-        </ul>
-      {% endif %}
-      </div>
-    </div>
-
-    <div class="section" id="pages-section">
-      <h3>Pages</h3>
-      <div id="pages-list">
-      {% if pages|length == 0 %}
-        <p class="small">No linked pages found.</p>
-      {% else %}
-        <ul>
-        {% for p in pages %}
-          <li>
-            <a href="{{ p.get('url') or p.get('_links') and p.get('_links').get('self') or '#' }}" target="_blank">{{ p.get('title') or p.get('name') or 'page' }}</a>
-            <div class="small">{{ p.get('excerpt') or p.get('summary') or (p.get('body') and p.get('body').get('storage') and p.get('body').get('storage')[:200]) or '' }}</div>
-          </li>
+          {% if c is mapping %}
+            {% set ctext = c.get('body') or c.get('text') or c.get('comment') %}
+            <li>
+              {% if ctext %}
+                <div>{{ ctext }}</div>
+                <div class="small">By: {{ c.get('author') or c.get('user') or '' }}</div>
+              {% else %}
+                <pre>{{ c | tojson(indent=2) }}</pre>
+              {% endif %}
+            </li>
+          {% elif c is string %}
+            <li>{{ c }}</li>
+          {% else %}
+            <li><pre>{{ c | tojson(indent=2) }}</pre></li>
+          {% endif %}
         {% endfor %}
         </ul>
       {% endif %}
@@ -272,13 +351,25 @@
     </div>
 
     <div class="section">
-      <h3>Confluence pages</h3>
+      <h3>Confluence Pages</h3>
       <div id="confluence-list">
         {% if incident.confluence and incident.confluence|length > 0 %}
           <ul>
             {% for p in incident.confluence %}
-              <li><a href="{{ p.url }}" target="_blank">{{ p.title }}</a>
-                <div class="small">{{ p.excerpt }}</div>
+              {# Build proper Confluence URL from various possible fields #}
+              {% set conf_url = p.url or (p._links and (p._links.webui or p._links.self)) or (p.webUrl) or (p.link) or '' %}
+              {# If URL is relative (starts with /), try to make it absolute using base from p._links.base #}
+              {% if conf_url and conf_url.startswith('/') and p._links and p._links.base %}
+                {% set conf_url = p._links.base + conf_url %}
+              {% endif %}
+              <li>
+                {% if conf_url %}
+                  <a href="{{ conf_url }}" target="_blank">{{ p.title or p.name or 'Confluence Page' }}</a>
+                {% else %}
+                  <span>{{ p.title or p.name or 'Confluence Page' }}</span> <span class="small">(no URL available)</span>
+                {% endif %}
+                {% if p.excerpt %}<div class="small">{{ p.excerpt }}</div>{% endif %}
+                {% if p.space and p.space.name %}<div class="small">Space: {{ p.space.name }}</div>{% endif %}
               </li>
             {% endfor %}
           </ul>
@@ -289,10 +380,43 @@
     </div>
 
     <div class="section">
-      <h3>Suggested resolution</h3>
+      <h3>Suggested Resolution</h3>
       <div id="suggested-resolution">
         {% if incident.suggested_resolution %}
-          <pre>{{ incident.suggested_resolution | tojson(indent=2) }}</pre>
+          {% set sr = incident.suggested_resolution %}
+          
+          {# Display probable causes (support both singular and plural keys) #}
+          <h4>Probable Causes:</h4>
+          {% set causes = sr.get('probable_causes') or ([sr.get('probable_cause')] if sr.get('probable_cause') else []) %}
+          {% if causes and causes|length > 0 %}
+            <ul>
+            {% for cause in causes %}
+              {% if cause %}
+              <li>{{ cause }}</li>
+              {% endif %}
+            {% endfor %}
+            </ul>
+          {% else %}
+            <p class="small">No probable causes identified.</p>
+          {% endif %}
+          
+          {# Display all resolution steps #}
+          <h4>Resolution Steps:</h4>
+          {% set steps = sr.get('resolution_steps') or [] %}
+          {% if steps and steps|length > 0 %}
+            <ol>
+            {% for step in steps %}
+              <li>{{ step }}</li>
+            {% endfor %}
+            </ol>
+          {% else %}
+            <p class="small">No resolution steps available.</p>
+          {% endif %}
+          
+          {# Display confidence if available #}
+          {% if sr.get('confidence') %}
+            <p class="small">Confidence: {{ (sr.get('confidence') * 100)|round(1) }}%</p>
+          {% endif %}
         {% else %}
           <p class="small">No suggested resolution yet.</p>
         {% endif %}
@@ -319,6 +443,47 @@
           el.innerHTML = html.join('');
         }
         function escapeHtml(s){ return (s||'').replace(/[&<>\"']/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":"&#39;"}[c]; }); }
+        
+        function renderSuggestedResolution(sr, el) {
+          if (!sr) {
+            el.innerHTML = '<p class="small">No suggested resolution yet.</p>';
+            return;
+          }
+          var html = [];
+          
+          // Render probable causes
+          html.push('<h4>Probable Causes:</h4>');
+          var causes = sr.probable_causes || (sr.probable_cause ? [sr.probable_cause] : []);
+          if (causes.length > 0) {
+            html.push('<ul>');
+            causes.forEach(function(cause) {
+              if (cause) html.push('<li>' + escapeHtml(cause) + '</li>');
+            });
+            html.push('</ul>');
+          } else {
+            html.push('<p class="small">No probable causes identified.</p>');
+          }
+          
+          // Render resolution steps
+          html.push('<h4>Resolution Steps:</h4>');
+          var steps = sr.resolution_steps || [];
+          if (steps.length > 0) {
+            html.push('<ol>');
+            steps.forEach(function(step) {
+              html.push('<li>' + escapeHtml(step) + '</li>');
+            });
+            html.push('</ol>');
+          } else {
+            html.push('<p class="small">No resolution steps available.</p>');
+          }
+          
+          // Render confidence
+          if (sr.confidence) {
+            html.push('<p class="small">Confidence: ' + (sr.confidence * 100).toFixed(1) + '%</p>');
+          }
+          
+          el.innerHTML = html.join('');
+        }
 
         async function fetchIncident(){
           try{
@@ -337,11 +502,7 @@
             if(cl) renderList(cl, data.confluence);
             var sr = document.getElementById('suggested-resolution');
             if(sr){
-              if(data.suggested_resolution){
-                sr.innerHTML = '<pre>'+escapeHtml(JSON.stringify(data.suggested_resolution, null, 2))+'</pre>';
-              } else {
-                sr.innerHTML = '<p class="small">No suggested resolution yet.</p>';
-              }
+              renderSuggestedResolution(data.suggested_resolution, sr);
             }
             // Update issue / node display (render as human-readable text/list)
             try{
