@@ -1,4 +1,3 @@
-import pytest
 from unittest.mock import MagicMock
 
 from src.neo_schema import query_schema, sample_nodes
