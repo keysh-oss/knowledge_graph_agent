@@ -1,0 +1,337 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Incident Popup</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    .card { border: 1px solid #ddd; padding: 16px; border-radius: 8px; max-width: 900px; }
+    h1 { margin-top: 0; }
+    .section { margin-top: 12px; }
+    pre { background:#f6f6f6; padding:8px; border-radius:4px; overflow:auto }
+    .small { color: #666; font-size: 0.9em }
+    .incident-alert { background: #fff3cd; border: 1px solid #ffc107; padding: 12px; border-radius: 6px; margin-bottom: 16px; }
+    .incident-alert h3 { margin: 0 0 8px 0; color: #856404; }
+    .incident-alert .message { font-size: 1.1em; color: #333; }
+  </style>
+</head>
+<body>
+  <div class="card">
+
+  
+  
+  <div class="incident-alert">
+    <h3>🚨 Slack Incident</h3>
+    <div class="message" id="incident-message"></div>
+    
+  </div>
+
+  <p class="small">Last update: <span id="last-updated">now</span></p>
+
+    
+    
+    
+    
+    
+    
+    
+    
+    
+
+    
+    <div class="section" id="issue-section">
+      <h3>Issues / Nodes from Neo4j</h3>
+  <div id="issue-data">
+      
+      
+      
+      
+      
+      
+      
+      
+      
+      
+      
+      
+      
+      
+        
+      
+      
+      
+      
+      
+      
+      
+      
+      
+      
+      
+      
+      
+      
+      
+      
+      
+
+      
+      
+
+      
+        <p class="small">Found 1 matching issue(s)/node(s):</p>
+        <ul>
+        
+          
+          
+          
+          
+          
+          <li>
+            
+              <strong>None</strong>
+            
+             — None
+            
+          </li>
+        
+        </ul>
+      
+  </div>
+    </div>
+
+    <div class="section" id="messages-section">
+      <h3>Messages</h3>
+      <div id="messages-list">
+      
+        <p class="small">No related messages found.</p>
+      
+      </div>
+    </div>
+
+    <div class="section" id="comments-section">
+      <h3>Comments</h3>
+      <div id="comments-list">
+      
+        <p class="small">No comments found.</p>
+      
+      </div>
+    </div>
+
+    <div class="section" id="projects-section">
+      <h3>Projects</h3>
+      <div id="projects-list">
+      
+        <p class="small">No linked projects found.</p>
+      
+      </div>
+    </div>
+  
+
+    <!-- Enrichment sections (Jira / Confluence / Suggested resolution) -->
+    <div class="section">
+      <h3>Jira — Tasks executed on previous day</h3>
+      <div id="jira-prev">
+        
+          <ul>
+            
+              <li><a href="https://shahkeyur61.atlassian.net/browse/KAN-10" target="_blank">KAN-10</a> — Deploy DB driver <span class="small">(Done)</span></li>
+            
+          </ul>
+        
+      </div>
+    </div>
+
+    <div class="section">
+      <h3>Jira — Related Issues</h3>
+      <div id="jira-related">
+        
+          <ul>
+            
+              <li><a href="https://shahkeyur61.atlassian.net/browse/KAN-13" target="_blank">KAN-13</a> — Database issue <span class="small">(In Progress)</span></li>
+            
+          </ul>
+        
+      </div>
+    </div>
+
+    <div class="section">
+      <h3>Confluence Pages</h3>
+      <div id="confluence-list">
+        
+          <ul>
+            
+              
+              
+              
+              
+              <li>
+                
+                  <a href="https://shahkeyur61.atlassian.net/wiki/spaces/~712020581a2377b052428c8c08aa6b4c747f53/pages/196702/Getting+started+in+Confluence+from+Jira" target="_blank">Getting started in Confluence from Jira</a>
+                
+                
+                
+              </li>
+            
+          </ul>
+        
+      </div>
+    </div>
+
+    <div class="section">
+      <h3>Suggested resolution</h3>
+      <div id="suggested-resolution">
+        
+          <p class="small">No suggested resolution yet.</p>
+        
+      </div>
+    </div>
+
+    <script>
+      // Simple polling to refresh incident enrichment data
+      (function(){
+  var iid = '43acec58-df3c-40c5-bf0c-cbdb82456b53';
+  var token = '';
+        function humanNow(){ return new Date().toLocaleString(); }
+        function renderList(el, items){
+          if(!items || items.length === 0){ el.innerHTML = '<p class="small">No items found.</p>'; return; }
+          var html = ['<ul>'];
+          items.forEach(function(it){
+            var url = it.url || '#';
+            var key = it.key || it.id || it.title || '';
+            var summary = it.summary || it.excerpt || '';
+            var status = it.status ? (' <span class="small">(' + it.status + ')</span>') : '';
+            html.push('<li><a href="'+url+'" target="_blank">'+key+'</a> — '+escapeHtml(summary)+status+'</li>');
+          });
+          html.push('</ul>');
+          el.innerHTML = html.join('');
+        }
+        function escapeHtml(s){ return (s||'').replace(/[&<>\"']/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":"&#39;"}[c]; }); }
+
+        async function fetchIncident(){
+          try{
+            var url = '/incident/' + iid + (token ? ('?t=' + token) : '');
+            var resp = await fetch(url, {credentials: 'same-origin'});
+            if(!resp.ok) return;
+            var data = await resp.json();
+            document.getElementById('last-updated').textContent = humanNow();
+
+            // Update prev-day jira
+            var jp = document.getElementById('jira-prev');
+            if(jp) renderList(jp, data.jira_prev_day);
+            var jr = document.getElementById('jira-related');
+            if(jr) renderList(jr, data.jira);
+            var cl = document.getElementById('confluence-list');
+            if(cl) renderList(cl, data.confluence);
+            var sr = document.getElementById('suggested-resolution');
+            if(sr){
+              if(data.suggested_resolution){
+                sr.innerHTML = '<pre>'+escapeHtml(JSON.stringify(data.suggested_resolution, null, 2))+'</pre>';
+              } else {
+                sr.innerHTML = '<p class="small">No suggested resolution yet.</p>';
+              }
+            }
+            // Update issue / node display (render as human-readable text/list)
+            try{
+              var issueEl = document.getElementById('issue-data');
+              var issueObj = (data.data && data.data.issue) ? data.data.issue : (data.issue);
+              if((!issueObj || (Array.isArray(issueObj) && issueObj.length===0)) && Array.isArray(data.mcp_result) && data.mcp_result.length>0){
+                issueObj = data.mcp_result;
+              }
+              if(!issueObj && data.mcp_result && data.mcp_result.issue){
+                issueObj = data.mcp_result.issue;
+              }
+              if(issueEl){
+                if(Array.isArray(issueObj)){
+                  var html = ['<ul>'];
+                  issueObj.forEach(function(row){
+                    var node = row.i || row.n || row || {};
+                    var url = node.url || '#';
+                    var key = node.key || node.id || node.title || '';
+                    var summary = node.summary || node.label || node.title || '';
+                    var status = node.status ? (' <span class="small">(' + node.status + ')</span>') : '';
+                    html.push('<li><a href="'+url+'" target="_blank">'+escapeHtml(key)+'</a> — '+escapeHtml(summary)+status+'</li>');
+                  });
+                  html.push('</ul>');
+                  issueEl.innerHTML = html.join('');
+                } else if(issueObj && typeof issueObj === 'object'){
+                  var key = issueObj.key || issueObj.id || '';
+                  var summary = issueObj.summary || issueObj.title || '';
+                  var status = issueObj.status ? (' <span class="small">(' + issueObj.status + ')</span>') : '';
+                  issueEl.innerHTML = '<div><strong>'+escapeHtml(key)+'</strong> — '+escapeHtml(summary)+'</div>' + '<div class="small">Status: '+ (issueObj.status||'') +'</div>';
+                } else {
+                  issueEl.innerHTML = '<p class="small">No issue data available</p>';
+                }
+              }
+            }catch(e){/* ignore */}
+
+            // Update the visible message/description if present
+            try{
+              var msgEl = document.getElementById('incident-message');
+              if(msgEl){ msgEl.textContent = data.message || data.description || msgEl.textContent; }
+            }catch(e){}
+
+            // helper: render items as human-readable lists (fall back to JSON)
+            function renderJsonItems(el, items){
+              if(!el) return;
+              if(!items || items.length === 0){ el.innerHTML = '<p class="small">No items found.</p>'; return; }
+              var html = ['<ul>'];
+              items.forEach(function(it){
+                if(!it){ return; }
+                if(typeof it === 'string'){
+                  html.push('<li>'+escapeHtml(it)+'</li>');
+                  return;
+                }
+                var text = it.text || (it.body && (it.body.storage || it.body.value || it.body.text)) || it.message || it.comment || it.summary || it.excerpt || '';
+                var meta = it.user || it.author || it.source || it.channel || '';
+                if(text){
+                  html.push('<li>'+escapeHtml(text)+'<div class="small">'+escapeHtml(meta)+'</div></li>');
+                } else {
+                  html.push('<li><pre>'+escapeHtml(JSON.stringify(it, null, 2))+'</pre></li>');
+                }
+              });
+              html.push('</ul>');
+              el.innerHTML = html.join('');
+            }
+
+            // Update messages/comments/pages/projects sections
+            var msgs = document.getElementById('messages-list');
+            if(msgs) renderJsonItems(msgs, (data.data && data.data.messages) || data.messages || []);
+            var cms = document.getElementById('comments-list');
+            if(cms) renderJsonItems(cms, (data.data && data.data.comments) || data.comments || []);
+            var pls = document.getElementById('pages-list');
+            if(pls) renderJsonItems(pls, (data.data && data.data.pages) || data.pages || []);
+            var prs = document.getElementById('projects-list');
+            if(prs) renderJsonItems(prs, (data.data && data.data.projects) || data.projects || []);
+
+            // Update knowledge graph (if new graph present in response)
+            try{
+              var newKg = null;
+              if(data.mcp && data.mcp.graph) newKg = data.mcp.graph;
+              else if(data.mcp_result && data.mcp_result.graph) newKg = data.mcp_result.graph;
+              else if(data.data && data.data.graph) newKg = data.data.graph;
+              if(newKg){
+                // replace nodes/edges in existing vis DataSets
+                if(typeof nodes !== 'undefined' && typeof edges !== 'undefined'){
+                  nodes.clear();
+                  edges.clear();
+                  (newKg.nodes || []).forEach(function(n){ nodes.add({id:n.id, label:n.label, title: JSON.stringify(n.props, null, 2), _props: n.props}); });
+                  (newKg.edges || []).forEach(function(e){ edges.add({from:e.from, to:e.to, label:e.label}); });
+                }
+              }
+            }catch(e){ /* ignore graph update errors */ }
+          }catch(e){ /* ignore transient errors */ }
+        }
+
+        // initial fetch + polling
+        fetchIncident();
+        setInterval(fetchIncident, 5000);
+      })();
+    </script>
+
+    
+
+  </div>
+</body>
+</html>

@@ -67,12 +67,53 @@ def require_auth(f):
 # in-memory store of incidents keyed by id
 INCIDENTS = {}
 
+# Dedupe map: Slack ts -> iid. Prevents multiple popups for the same Slack message
+# even when multiple agent processes post the same incident.
+SLACK_TS_TO_IID = {}
+
+
 @app.route("/incident", methods=["POST"])
 @require_auth
 def receive_incident():
     payload = request.get_json()
+
+    # Dedupe: if the same Slack message (by ts) was already received, return
+    # the existing popup_url instead of creating a new incident.
+    try:
+        slack_ts = None
+        slack_section = payload.get('slack') or {}
+        if isinstance(slack_section, dict):
+            slack_ts = slack_section.get('ts')
+        if slack_ts and slack_ts in SLACK_TS_TO_IID:
+            existing_iid = SLACK_TS_TO_IID[slack_ts]
+            if existing_iid in INCIDENTS:
+                logging.info("Dedupe: incident for Slack ts=%s already exists as %s", slack_ts, existing_iid)
+                popup_url = f"/popup/{existing_iid}"
+                # preserve token if one was issued previously
+                token = request.headers.get("X-API-KEY")
+                if UI_API_KEY and token and token == UI_API_KEY:
+                    try:
+                        tok = uuid.uuid4().hex
+                        ONE_TIME_TOKENS[tok] = time.time() + ONE_TIME_TOKEN_TTL
+                        popup_url = f"/popup/{existing_iid}?t={tok}"
+                    except Exception:
+                        pass
+                return jsonify({"popup_url": popup_url, "dedupe": True})
+    except Exception:
+        pass
+
     iid = str(uuid.uuid4())
     INCIDENTS[iid] = payload
+
+    # Register Slack ts -> iid mapping for deduplication
+    try:
+        slack_section = payload.get('slack') or {}
+        if isinstance(slack_section, dict):
+            slack_ts = slack_section.get('ts')
+            if slack_ts:
+                SLACK_TS_TO_IID[slack_ts] = iid
+    except Exception:
+        pass
     # store a best-effort top-level message so the popup can show the
     # incident text immediately even if the agent nested it under `data` or `slack`.
     try:
@@ -140,6 +181,45 @@ def receive_incident():
                     # mark found so template renders the enrichment block
                     inc['found'] = True
         normalize(iid)
+    except Exception:
+        pass
+    # Normalize possible multi-row results into a consistent `mcp_result` list
+    try:
+        inc = INCIDENTS.get(iid)
+        if inc:
+            rows = []
+            # common places agent may put multiple-match rows
+            for key in ('mcp_result', 'mcp_rows', 'neo4j_result', 'neo4j_rows'):
+                v = inc.get(key)
+                if isinstance(v, list) and v:
+                    rows.extend(v)
+            # also check nested data section
+            data_section = inc.get('data') or {}
+            for key in ('mcp_rows', 'rows'):
+                v = data_section.get(key)
+                if isinstance(v, list) and v:
+                    rows.extend(v)
+            if rows:
+                # dedupe by string key to avoid duplicates
+                seen = set()
+                uniq = []
+                for r in rows:
+                    try:
+                        if isinstance(r, dict):
+                            # attempt to extract stable key
+                            cand = (r.get('i') or r.get('n') or r)
+                            if isinstance(cand, dict):
+                                k = cand.get('key') or cand.get('id') or cand.get('url') or json.dumps(cand, sort_keys=True)
+                            else:
+                                k = str(cand)
+                        else:
+                            k = str(r)
+                    except Exception:
+                        k = str(r)
+                    if k not in seen:
+                        seen.add(k)
+                        uniq.append(r)
+                inc['mcp_result'] = uniq
     except Exception:
         pass
     popup_url = f"/popup/{iid}"
@@ -257,7 +337,6 @@ def get_incident(iid):
 
 
 @app.route('/claim_popup', methods=['POST'])
-@require_auth
 def claim_popup():
     """Atomically claim a popup for an incident so only one agent/process
     opens the browser window. POST JSON: {"iid": "..."}. Returns

@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Incident Popup</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    .card { border: 1px solid #ddd; padding: 16px; border-radius: 8px; max-width: 900px; }
+    h1 { margin-top: 0; }
+    .section { margin-top: 12px; }
+    pre { background:#f6f6f6; padding:8px; border-radius:4px; overflow:auto }
+    .small { color: #666; font-size: 0.9em }
+    .incident-alert { background: #fff3cd; border: 1px solid #ffc107; padding: 12px; border-radius: 6px; margin-bottom: 16px; }
+    .incident-alert h3 { margin: 0 0 8px 0; color: #856404; }
+    .incident-alert .message { font-size: 1.1em; color: #333; }
+  </style>
+</head>
+<body>
+  <div class="card">
+
+  
+  
+  <div class="incident-alert">
+    <h3>🚨 Slack Incident</h3>
+    <div class="message" id="incident-message"></div>
+    
+  </div>
+
+  <p class="small">Last update: <span id="last-updated">now</span></p>
+
+    
+    <div class="section">
+      <h3>Message (no matching incident in Neo4j)</h3>
+      <pre></pre>
+    </div>
+    
+
+  </div>
+</body>
+</html>
